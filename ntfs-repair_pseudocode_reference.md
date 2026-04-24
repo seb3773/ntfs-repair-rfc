@@ -56,6 +56,7 @@ function validate_boot(sector):
     if spc == 0 OR (spc & (spc - 1)) != 0:         return false  // not power of 2
     if le64(sector[0x28]) == 0:                     return false  // total_sectors = 0
     if le64(sector[0x30]) == 0:                     return false  // $MFT LCN = 0
+    if le64(sector[0x38]) == 0:                     return false  // $MFTMirr LCN = 0
     return true
 ```
 
@@ -666,12 +667,17 @@ function io_read_safe(ctx, offset, buf, len):
     return ERR_BAD_SECTOR
 
 function io_read_with_timeout(ctx, offset, buf, len, timeout_sec=30):
-    // Set alarm for hanging I/O
-    alarm(timeout_sec)
-    result = io_read_safe(ctx, offset, buf, len)
-    alarm(0)                                     // cancel alarm
+    // WARNING: Do NOT use alarm() or ppoll() for block device I/O timeouts.
+    // alarm() is process-wide and incompatible with parallel threads.
+    // ppoll() returns POLLIN immediately on block devices, so pread() still hangs.
+    // 
+    // Implementers MUST use one of two patterns (detailed in Spec §6.1):
+    // 1. io_uring with IORING_OP_LINK_TIMEOUT (Recommended for Linux)
+    // 2. Thread-per-IO watchdog with pthread_mutex_timedlock() (Portable fallback)
 
-    if result == ERR_TIMEOUT:                    // SIGALRM handler sets this
+    result = perform_safe_timeout_read(ctx, offset, buf, len, timeout_sec)
+
+    if result == ERR_TIMEOUT:
         log(FATAL, E_IO_TIMEOUT, "I/O timeout at 0x%X after %ds", offset, timeout_sec)
         abort()
 

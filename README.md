@@ -28,7 +28,7 @@ Every Linux distribution ships with `ntfsfix` (from ntfs-3g) and `ntfsprogs`, bu
 
 **The result:** users with corrupted NTFS volumes on Linux are told to "boot into Windows and run `chkdsk`" — a solution that is impractical for headless servers, embedded systems, dual-boot recovery scenarios, and environments where Windows is simply not available.
 
-This RFC changes that.
+This RFC aims to provide the technical foundation to help change that.
 
 ---
 
@@ -68,6 +68,14 @@ This specification was developed under a strict **Clean Room** methodology to en
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### Author's Declaration of Absolute Air Gap
+
+I, **seb3773** (author of this specification), hereby formally declare and affirm on my honor that to ensure absolute compliance with the Clean Room concept:
+1. I will **never** write, contribute to, or review any source code for an NTFS repair utility based on these specifications.
+2. I will **never** provide, share, or publish the raw analysis elements, memory dumps, strace logs, or behavioral observations that allowed me to write this specification to any developer, under any circumstances.
+
+This guarantees a total and absolute "air gap" (Chinese wall) between the knowledge I possess from my analysis and the developers who will ultimately produce the code from these specifications.
 
 ### Behavioral Observation Methodology
 

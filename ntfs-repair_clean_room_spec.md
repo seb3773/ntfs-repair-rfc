@@ -13,8 +13,8 @@
 > This document is a **Functional Specification** created via the "Clean Room" (or Chinese Wall) reverse engineering methodology. 
 > 
 > 1. It has been generated entirely through black-box provocation testing, runtime behavior observation (strace, I/O monitoring), and architectural abstraction of proprietary NTFS repair utilities.
-> 2. It contains **NO assembly instructions, NO binary offsets, NO memory addresses, and NO decompiled source code** from any proprietary software.
-> 3. It is designed to be legally safely consumed by developers who have **never** interacted with or disassembled the original proprietary binaries, in order to create a compatible, open-source reimplementation.
+> 2. It contains **NO assembly instructions, NO binary offsets, NO memory addresses, and NO decompiled source code** from any closed-source software.
+> 3. It is designed to be legally safely consumed by developers who have **never** interacted with or disassembled the original closed-source utilities, in order to create a compatible, open-source reimplementation.
 
 ---
 
@@ -36,18 +36,18 @@ The orchestrator must maintain a centralized State Object (Context) throughout e
 ### 1.3 Verification Orchestrator (16-Step Pipeline)
 The main verification loop must run in distinct phases to safely rebuild the volume. This strict ordering prevents secondary corruption:
 0. **Boot Sector Validation:** Validate BPB and magic bytes.
-1. **Journal Replay ($LogFile):** Apply uncommitted log transactions.
-2. **System File Open:** Initialize handlers for metadata files.
-3. **AttrDef & Index Setup:** Load attribute definitions.
-4. **$UpCase Loading:** Load the unicode uppercase table for case-insensitive comparisons.
-5. **MFT Record Verification:** Initial scan to detect orphans and validate headers.
+1. **System File Open:** Initialize handlers for metadata files ($MFT, $MFTMirr, $Bitmap, $LogFile).
+2. **AttrDef & $UpCase Loading:** Load attribute definitions and the volume's Unicode uppercase table.
+3. **Journal Replay ($LogFile):** Apply uncommitted log transactions (requires system files to be open).
+4. **MFT Record Verification:** Initial scan to detect orphans and validate headers.
+5. **Zombie Deletion:** Remove empty MFT records (with Anti-Zombie protection).
 6. **Extended Attributes (EA) Verification:** Validate `$EA` blocks.
 7. **System File Creation/Repair:** Rebuild missing fundamental system structures.
 8. **Folder ($I30) Index Verification:** Validate and rebuild directory B-Trees.
 9. **Orphan Recovery:** Relocate severed files to a lost+found directory.
 10. **System File Re-open:** Refresh handlers after structural repairs.
 11. **$Extend Indexes Verification:** Validate `$Quota`, `$ObjId`, and `$Reparse` B-Trees.
-12. **Empty Data Insertion:** Fix metadata alignment.
+12. **Data Alignment Fix:** Fix metadata alignment (8-byte attribute boundaries).
 13. **Security ($Secure) Verification:** Validate and rebuild `$SII` and `$SDS` trees.
 14. **$Bitmap Verification:** Reconcile actual cluster usage against the volume bitmap.
 15. **$MFTMirr Correction:** Final sync of the primary MFT to its mirror.
@@ -150,7 +150,7 @@ While standard NTFS documentation ([MS-NTFS] §2.5) describes Data Runs as a "va
 1. **Attribute Validation:** The parser must explicitly check the Non-Resident flag and ensure the Attribute Type is `0x80` ($DATA).
 2. **Compression/Sparse Checks:** The parser must evaluate the Attribute Flags (offset `0x0C`).
    - If `0x0001` (Sparse) is set: Physical cluster allocation validation is skipped for zero-filled VCN ranges.
-   - If `0x8000` (Compression) is set: The run is evaluated in chunks defined by the Compression Unit Size (default 16 clusters). The payload must be decompressed using the standard **LZNT1** algorithm (no proprietary modifications are present).
+   - If `0x8000` (Compression) is set: The run is evaluated in chunks defined by the Compression Unit Size (default 16 clusters). The payload must be decompressed using the standard **LZNT1** algorithm (no undocumented modifications are present).
 3. **Cluster Arithmetic & Sign Extension:** 
    - The Data Run length and offset MUST be reconstructed by reading the specified $N$ bytes and applying a bitwise left-shift for each subsequent byte.
    - **Critical:** The physical LCN offset is a *signed* value (it can point backwards on the disk). The parser must implement strict **Sign Extension** on the most significant byte of the offset to correctly calculate negative jumps.
@@ -173,15 +173,18 @@ While standard NTFS documentation ([MS-NTFS] §2.5) describes Data Runs as a "va
 The engine uses a heavily optimized caching layer to translate Virtual Cluster Numbers (VCN) to Logical Cluster Numbers (LCN) during file reading.
 
 **Cache Structure:**
-The runlist cache stores decoded Data Runs as an array of 12-byte entries. Each entry represents a contiguous run of clusters:
-- `start_cluster` (uint32): The starting VCN of the run.
-- `data_offset` (uint32): The physical data offset (LCN) or a sparse flag (e.g., `0xFFFFFFFF`).
-- `count` (uint32): The number of contiguous clusters in this run.
+The runlist cache stores decoded Data Runs as an array of entries. Each entry represents a contiguous run of clusters:
+- `start_vcn` (uint64): The starting VCN of the run.
+- `lcn` (uint64): The physical Logical Cluster Number, or `UINT64_MAX` for sparse runs.
+- `count` (uint64): The number of contiguous clusters in this run.
+
+> [!WARNING]
+> **Do NOT use `uint32` for cluster addresses.** A uint32 overflows at 2³² clusters. With 4 KB clusters, this limits the volume to 16 TB — which is below the NTFS maximum of 256 TB. All VCN/LCN fields MUST be `uint64_t`.
 
 **VCN to LCN Translation Algorithm:**
 When the engine requests to read a specific VCN, it MUST NOT parse the raw Data Run stream again. Instead, it must:
-1. **Binary Search:** Perform a standard `O(log n)` binary search on the cached 12-byte entries using the requested VCN.
-2. **Cache Hit:** If the VCN falls within an entry's `[start_cluster, start_cluster + count]` range, compute the physical LCN by adding the offset `(VCN - start_cluster)` to the entry's `data_offset`.
+1. **Binary Search:** Perform a standard `O(log n)` binary search on the cached 24-byte entries using the requested VCN.
+2. **Cache Hit:** If the VCN falls within an entry's `[start_vcn, start_vcn + count]` range, compute the physical LCN by adding the offset `(VCN - start_vcn)` to the entry's `lcn`.
 3. **Cache Miss:** If the VCN is not in the cache, the engine must fall back to reading the actual cluster from disk by dispatching to the low-level physical seek and read methods.
 
 ### 2.5 NTFS Version Detection & Compatibility Matrix
@@ -213,7 +216,7 @@ When reading an MFT record, the utility must evaluate its structural integrity:
   - **Range Limitation Rule (CRITICAL):** The `$MFTMirr` is NOT a complete mirror of the `$MFT`. It typically only contains the first 4 system records (records 0–3). The utility MUST check if the corrupt record ID falls within the mirrored range before attempting a recovery from `$MFTMirr`. For records beyond this range, the `$MFTMirr` is useless, and the record must remain marked as `FREE` and trigger Orphan Recovery.
 
 **Step 2: Final Synchronization (Phase 15)**
-Unlike legacy proprietary utilities that perform a dangerous "Blind Sync" based solely on header integrity, this specification mandates a strict **Semantic Validation Barrier** to prevent "Bit Rot" corruption from overwriting a healthy mirror.
+Unlike legacy closed-source utilities that perform a dangerous "Blind Sync" based solely on header integrity, this specification mandates a strict **Semantic Validation Barrier** to prevent "Bit Rot" corruption from overwriting a healthy mirror.
 - **Semantic Validation Barrier:** Before syncing a primary `$MFT` record to the `$MFTMirr`, the engine MUST validate the internal semantics of all its attributes. It must verify valid Attribute Type codes, ensure the sum of attribute sizes is `≤` the record size, validate the internal consistency of Data Runs, and check for valid Unicode `$FILE_NAME` strings. Structural header checks (`FILE` magic, USA fixups) alone are insufficient.
 - **Action:** If the primary `$MFT` record passes BOTH structural and semantic validation, the utility overwrites the `$MFTMirr` record. However, if the primary record is structurally sound but semantically corrupt (Bit Rot), and the `$MFTMirr` record is semantically perfect, the utility MUST reverse the flow and use the `$MFTMirr` to heal the `$MFT`.
 - **Bounds Check (CRITICAL):** This synchronization MUST be strictly bounded by the physical size/Data Run of the `$MFTMirr`. Because the mirror is partial, the utility only syncs the first N records (usually 0 to 3). Attempting to copy the entire `$MFT` will overwrite arbitrary disk data.
@@ -264,7 +267,7 @@ During the rebuild phase, the engine must implement three critical defensive che
 - **Mandatory Iterative Traversal (VULNERABILITY FIX):**
   > [!CAUTION]
   > **Stack Overflow Attack Vector — Confirmed via Black-Box Testing**
-  > Black-box provocation testing on a proprietary NTFS repair engine has confirmed that at least one production implementation uses recursive function calls (the walker function calls itself for each child record) with **no depth limit**. With a typical stack frame of ~140–340 bytes per recursion level and the default Linux stack size of 8 MB, an adversarial `$ATTRIBUTE_LIST` containing ~25,000 chained MFT records (without forming a cycle, thus bypassing the circular reference check) will exhaust the call stack and cause a `SIGSEGV` crash. This crash occurs on critical code paths including Attribute List repair, orphan recovery, MFT verification, and journal replay. Other implementations may or may not share this vulnerability, but the attack vector exists for any recursive traversal without depth limiting.
+  > Black-box provocation testing on existing NTFS repair utilities has confirmed that at least one production implementation uses recursive function calls (the walker function calls itself for each child record) with **no depth limit**. With a typical stack frame of ~140–340 bytes per recursion level and the default Linux stack size of 8 MB, an adversarial `$ATTRIBUTE_LIST` containing ~25,000 chained MFT records (without forming a cycle, thus bypassing the circular reference check) will exhaust the call stack and cause a `SIGSEGV` crash. This crash occurs on critical code paths including Attribute List repair, orphan recovery, MFT verification, and journal replay. Other implementations may or may not share this vulnerability, but the attack vector exists for any recursive traversal without depth limiting.
 
   The open-source implementation MUST use **iterative traversal with an explicit heap-allocated stack** (e.g., a growable `uint32_t` array of pending MFT record IDs) for ALL chain/tree walkers. Recursive implementations are **forbidden**.
   ```
@@ -290,11 +293,82 @@ During the rebuild phase, the engine must implement three critical defensive che
 
 ### 3.6 $FILE_NAME Namespace Validation & DOS 8.3 Regeneration
 The utility must ensure absolute consistency between Long File Names (Win32) and Short File Names (DOS 8.3) across all MFT records to prevent namespace corruption in the B-Tree indexes.
-- **Validation:** The engine must read the namespace byte (offset `+0x41` in the `$FILE_NAME` attribute). It validates that the namespace is legal (0-3) and checks the bits (1 = Win32, 2 = DOS). 
+- **Validation:** The engine must read the namespace byte (offset `+0x41` in the `$FILE_NAME` attribute). It validates that the namespace is legal (0–3) and checks the bits (1 = Win32, 2 = DOS, 3 = Win32+DOS combined). 
 - **Cross-Validation:** It must verify that every Win32 name has a corresponding, valid DOS 8.3 paired name.
-- **Regeneration Action:** If the DOS name is corrupted, missing, or the pairing is broken, the engine MUST regenerate the short name dynamically. It does this by taking the Win32 name, converting it to uppercase, truncating it, stripping illegal characters, and appending the standard `~N` suffix. **(CRITICAL: The generation algorithm must be collision-aware. It must scan the current directory to ensure uniqueness. If `FILE~1.TXT` exists, it must increment to `FILE~2.TXT`, etc.)**
-  - *Volume Config Exception:* Short name regeneration MUST respect the volume configuration. If 8.3 short name creation is disabled at the volume level, the engine must skip this regeneration step to avoid polluting the B-Tree with unwanted namespaces.
+- **Volume Config Exception:** Short name regeneration MUST respect the volume configuration. If 8.3 short name creation is disabled at the volume level (check `NtfsDisable8dot3NameCreation` registry flag, or absence of DOS namespace entries on the volume), the engine MUST skip this regeneration step entirely.
 - **Irreparable Names:** If the name cannot be regenerated or repaired, the `$FILE_NAME` attribute must be deleted, and the MFT record's `LinkCount` (hardlinks) MUST be decremented accordingly.
+
+**8.3 Short Name Generation Algorithm:**
+
+When the DOS name is missing or corrupt, the engine MUST regenerate it using the following deterministic algorithm (derived from publicly documented Windows behavior):
+
+*Step 1 — Normalize the Long File Name (LFN):*
+1. Convert all characters to uppercase (using the volume's `$UpCase` table).
+2. Strip all leading and trailing spaces.
+3. Strip all leading periods.
+4. Remove all but the last period (which separates base from extension).
+5. Replace illegal 8.3 characters with underscores (`_`). Illegal characters: `" * / : < > ? \ | + , ; = [ ]` and any character with code point < 0x20.
+
+*Step 2 — Truncate:*
+1. **Extension:** Take the first 3 valid characters after the last period. If no period exists, the extension is empty.
+2. **Basename:** Take the first 6 valid characters before the last period.
+
+*Step 3 — Collision Resolution (3-tier):*
+The engine MUST scan the parent directory's `$I30` index to check for collisions at each step.
+
+| Tier | Format | When Used | Example |
+| :---: | :--- | :--- | :--- |
+| 1 | `{base6}~{N}.{ext3}` | N = 1–9 (first 9 collisions) | `MYLONG~1.TXT` → `MYLONG~9.TXT` |
+| 2 | `{base5}~{NN}.{ext3}` | N = 10–99 | `MYLON~10.TXT` → `MYLON~99.TXT` |
+| 3 | `{base2}{HHHH}~{N}.{ext3}` | N > 99 (hash-based) | `MY021F~1.TXT` |
+
+- **Tier 3 hash:** The 4 hex digits are derived from a hash of the full long filename. This specification does not mandate a specific hash function — any deterministic 16-bit hash is acceptable, as long as the result is collision-checked against the directory.
+
+> [!NOTE]
+> **Windows interoperability:** Implementations based on this specification will generate short names that are **structurally valid** (correct format, no collisions, unique within the directory) but **may differ** from the names Windows would have generated. This is expected behavior: Windows uses an undocumented internal hash function for Tier 3, and the exact `~N` suffix assignment depends on directory creation order. After repair, `chkdsk /scan` will accept these names as valid. The only observable difference is cosmetic — the short name alias for a given file may change.
+- **Uniqueness guarantee:** The engine MUST verify that the generated short name does not collide with ANY existing entry in the directory (not just other generated names). If all 9 slots in a tier are exhausted, escalate to the next tier.
+
+```
+function generate_83_name(lfn, parent_dir_index, upcase_table):
+    // Normalize
+    upper = upcase_convert(lfn, upcase_table)
+    upper = strip_leading_trailing_spaces(upper)
+    upper = strip_leading_periods(upper)
+    upper = replace_illegal_chars(upper, '_')
+
+    // Split base and extension at last period
+    if '.' in upper:
+        base = chars_before_last_period(upper)
+        ext  = first_3_chars(chars_after_last_period(upper))
+    else:
+        base = upper
+        ext  = ""
+
+    // Tier 1: base6~N
+    base6 = first_6_chars(base)
+    for n in 1..9:
+        candidate = base6 + "~" + str(n) + "." + ext
+        if NOT parent_dir_index.contains(candidate):
+            return candidate
+
+    // Tier 2: base5~NN
+    base5 = first_5_chars(base)
+    for n in 10..99:
+        candidate = base5 + "~" + str(n) + "." + ext
+        if NOT parent_dir_index.contains(candidate):
+            return candidate
+
+    // Tier 3: base2 + hash4 + ~N
+    hash4 = hex4(hash16(lfn))
+    base2 = first_2_chars(base)
+    for n in 1..9:
+        candidate = base2 + hash4 + "~" + str(n) + "." + ext
+        if NOT parent_dir_index.contains(candidate):
+            return candidate
+
+    // Exhausted — this should never happen in practice
+    return ERROR("Cannot generate unique 8.3 name")
+```
 
 ### 3.7 Attribute Compaction & Migration Policies
 The utility must prioritize volume consistency over storage optimization. It must explicitly **AVOID** data migration between the MFT and cluster space.
@@ -321,9 +395,92 @@ If the `$BadClus` attribute's own Data Runs are corrupted (the tracker of bad se
 - **Validation:** After reconstruction, cross-check that all previously known bad LCNs are marked as `USED` in the `$Bitmap` (bad clusters must be allocated so they are never reused).
 
 ### 3.9 Compressed File Corruption (LZNT1)
-NTFS natively compresses files using the LZNT1 algorithm, dividing data into Compression Units (typically 16 clusters). Because compressed data relies heavily on dense dictionary references, a single bit flip can render an entire Compression Unit unreadable.
+NTFS natively compresses files using the LZNT1 algorithm ([MS-XCA] §2.5), dividing data into Compression Units (typically 16 clusters = 64 KB with 4 KB clusters). Because compressed data relies heavily on dense dictionary references, a single bit flip can render an entire Compression Unit unreadable.
+
 - **Decompression Failure:** If the engine fails to decompress a chunk during Data Run validation (e.g., encountering invalid chunk headers, out-of-bounds references, or buffer overflows), the engine MUST strictly apply the **"Deletion Over Dubious Repair"** philosophy.
 - **Action:** It is mathematically impossible to probabilistically reconstruct LZNT1 payloads. The engine MUST NOT attempt to guess the data. It must isolate the corruption by replacing the corrupted Compression Unit with a Sparse (zero-filled) run of the same size, or by truncating the file at the point of corruption. This isolates the damage to the specific 16-cluster block without invalidating the entire `$DATA` attribute.
+
+**LZNT1 Algorithm Specification (for implementers):**
+
+LZNT1 is an LZ77-based compression algorithm. The engine needs a decompressor to validate compressed files and to decompress `$LogFile` redo payloads. Source: [MS-XCA] §2.5 (public Microsoft specification).
+
+*Stream Structure:*
+A compressed stream consists of a sequence of independent **chunks**. Each chunk decompresses to at most **4096 bytes** (the sliding window size). Chunks are processed sequentially until the stream is exhausted.
+
+*Chunk Header (2 bytes, little-endian):*
+```
+Bit 15         Bit 12-14      Bits 0-11
+┌─────────┐   ┌──────────┐   ┌──────────────┐
+│ IsCompr │   │ Signature│   │ ChunkSize - 1│
+│ (1 bit) │   │ (3 bits) │   │ (12 bits)    │
+└─────────┘   └──────────┘   └──────────────┘
+```
+- `IsCompressed` (bit 15): `1` = compressed data follows, `0` = raw uncompressed data follows.
+- `Signature` (bits 12–14): Must be `0b011` (value 3). Other values indicate corruption.
+- `ChunkSize` (bits 0–11): Total size of the chunk data (excluding this 2-byte header) minus 1. Range: 0–4095.
+- A header value of `0x0000` terminates the stream.
+
+*Uncompressed Chunk (bit 15 = 0):*
+The next `ChunkSize + 1` bytes are raw, uncompressed data. Copy directly to output.
+
+*Compressed Chunk (bit 15 = 1):*
+The chunk data consists of **tagged groups**. Each group starts with a 1-byte **flag byte**:
+- Each of the 8 bits (LSB first) describes the next data element:
+  - `0` = **Literal byte**: copy 1 byte directly to output.
+  - `1` = **Back-reference tuple** (2 bytes, little-endian): an LZ77 match.
+
+*Back-Reference Tuple (16-bit):*
+The tuple encodes a (displacement, length) pair with **dynamic bit allocation** that depends on the current decompressed output position within the chunk:
+
+```
+Position in output    Displacement bits    Length bits
+0–511                 varies (4–12)        varies (12–4)
+```
+
+The split point is calculated as:
+```
+function compute_displacement_bits(output_position):
+    // Number of bits needed to address the current window
+    n = max(ceil(log2(output_position + 1)), 4)
+    return n    // displacement uses n bits, length uses (16 - n) bits
+
+displacement = (tuple >> (16 - disp_bits)) + 1      // 1-based
+length       = (tuple & ((1 << (16 - disp_bits)) - 1)) + 3  // minimum match = 3
+```
+
+*Decompression Loop (per compressed chunk):*
+```
+function decompress_lznt1_chunk(chunk_data, chunk_size):
+    output = []
+    pos = 0
+    while pos < chunk_size AND len(output) < 4096:
+        flag_byte = chunk_data[pos]
+        pos += 1
+        for bit in 0..7:
+            if pos >= chunk_size OR len(output) >= 4096:
+                break
+            if (flag_byte >> bit) & 1 == 0:
+                // Literal
+                output.append(chunk_data[pos])
+                pos += 1
+            else:
+                // Back-reference
+                tuple = le16(chunk_data[pos..pos+2])
+                pos += 2
+                disp_bits = compute_displacement_bits(len(output))
+                len_bits  = 16 - disp_bits
+                displacement = (tuple >> len_bits) + 1
+                length       = (tuple & ((1 << len_bits) - 1)) + 3
+                // Copy from output[current_pos - displacement]
+                src = len(output) - displacement
+                if src < 0:
+                    return ERROR  // corrupt: displacement beyond start
+                for i in 0..length-1:
+                    output.append(output[src + (i % displacement)])
+    return output
+```
+
+**Corruption indicators:** Signature ≠ 3, displacement pointing before start of output, chunk_size + 1 > 4096 for uncompressed chunks, infinite loops in decompression.
 
 ### 3.10 Alternate Data Streams (ADS) Handling
 In NTFS, a single file can contain multiple `$DATA` attributes. The primary data stream is unnamed (name length = 0), while Alternate Data Streams (ADS) have explicit names (e.g., `Zone.Identifier`).
@@ -366,7 +523,7 @@ The `$EA` attribute (Type `0x64`) stores a linked list of `FILE_FULL_EA_INFORMAT
 
 **`$TXF_DATA` (Transactional NTFS) — Confirmed Behavioral Note:**
 > [!NOTE]
-> Black-box analysis of a proprietary repair engine (attribute type `0x100`) confirms that `$TXF_DATA` receives **no explicit handling**: no comparison against type `0x100` is present anywhere in the binary, and the specialized Journal Replay path only dispatches for `$DATA` (`0x80`) and `$INDEX_ALLOCATION` (`0xB0`). `$TXF_DATA` may be updated incidentally by the generic positional copy handler if it happens to be located at the targeted log record offset — this is coincidental, not intentional.
+> Behavioral analysis of existing repair utilities (attribute type `0x100`) confirms that `$TXF_DATA` receives **no explicit handling**: no comparison against type `0x100` is present anywhere in the implementation, and the specialized Journal Replay path only dispatches for `$DATA` (`0x80`) and `$INDEX_ALLOCATION` (`0xB0`). `$TXF_DATA` may be updated incidentally by the generic positional copy handler if it happens to be located at the targeted log record offset — this is coincidental, not intentional.
 >
 > This is acceptable in practice: TxF has been deprecated since Windows 8 and is not present on volumes created or accessed by modern Windows. The open-source implementation MUST follow the same policy — **no explicit `$TXF_DATA` handling**. If encountered, treat as any other `$LOGGED_UTILITY_STREAM`: validate Data Runs, preserve payload opaquely, delete only on Data Run corruption.
 
@@ -445,7 +602,7 @@ If an index is flagged for verification or repair, the utility must not merely p
 
 **Level 4 (Supplementary): Orphan INDX Page Scan**
 > [!NOTE]
-> This level goes beyond the behavior of common proprietary engines. The MFT-first approach used by most repair tools has a documented blind spot: if an INDX page is allocated in `$INDEX_ALLOCATION` but is detached from the B-Tree walker (orphan page), its entries are invisible to reconstruction. Files whose **MFT records are intact** are always recovered (the MFT-first sweep catches them). But files whose **MFT records are damaged yet retain valid INDX entries in orphan pages** are permanently lost under a MFT-first-only strategy.
+> This level goes beyond the behavior of common closed-source engines. The MFT-first approach used by most repair tools has a documented blind spot: if an INDX page is allocated in `$INDEX_ALLOCATION` but is detached from the B-Tree walker (orphan page), its entries are invisible to reconstruction. Files whose **MFT records are intact** are always recovered (the MFT-first sweep catches them). But files whose **MFT records are damaged yet retain valid INDX entries in orphan pages** are permanently lost under a MFT-first-only strategy.
 
 - **Implementation:** After Level 3 reconstruction, the engine MUST perform a supplementary sequential scan of the entire `$INDEX_ALLOCATION` Data Run of each affected directory, reading every valid INDX page regardless of its tree connectivity.
 - **For each INDX page found:** Validate the `INDX` magic and USA. Extract all `$FILE_NAME` entries. For each entry whose MFT record is in `FREE` state (damaged), treat it as a recoverable filename hint and attempt to reconstruct a minimal MFT record stub.
@@ -535,31 +692,106 @@ If index entries are permanently lost during the rebuild, the targeted files wil
 
 ## 5. Journal Replay Engine ($LogFile)
 
-If a force-repair flag is provided and the volume is marked dirty, the utility must process the `$LogFile`. **NOTE:** The replay strategy is significantly more robust than a naïve blind binary patch. It uses **Semantic Attribute-Level Replay**, locating the target attribute dynamically before applying data, making it resilient to attribute relocation within the MFT record.
+If a force-repair flag is provided and the volume is marked dirty, the utility must process the `$LogFile`. **NOTE:** The replay strategy is significantly more robust than a naïve blind memory patch. It uses **Semi-Semantic Replay**, dispatching by opcode but sharing a generic positional handler for the majority of operations, and locating the target attribute dynamically before applying data.
+
+**Step 0 — Restart Area Recovery (RSTR):**
+The `$LogFile` begins with two Restart Pages (at offset 0 and offset `SystemPageSize`), used redundantly for crash safety. Each contains a `LFS_RESTART_AREA` structure that provides the recovery anchor point.
+
+1. Read both Restart Pages. Validate `RSTR` magic + USA fixup on each.
+2. If both are valid, use the one with the **higher `CurrentLsn`** (it is more recent).
+3. If only one is valid, use it. If neither is valid → **FATAL: $LogFile is unrecoverable.**
+4. From the Restart Area, extract:
+   - `CurrentLsn` — the LSN to start replaying from
+   - `Flags` — check bit `0x02` (`CLEAN_DISMOUNT`). If set → journal is clean, skip replay.
+   - `ClientArrayOffset` → `LFS_CLIENT_RECORD` array: contains `OldestLsn` (earliest log record that may still need replay)
+   - `SeqNumberBits` — number of bits for the sequence number portion of LSNs (needed to handle LSN wraparound)
 
 **Step 1 — Log Record Parsing:**
-- The engine locates the Restart Page and validates its `RSTR` magic.
-- For each `RCRD` log record, it parses the header to extract: the `target_attribute_type` (e.g., `0x80` for `$DATA`, `0xB0` for `$INDEX_ALLOCATION`) and the attribute `name_length` in characters.
+- Starting from `OldestLsn`, walk `RCRD` pages sequentially. Apply USA fixup to each page.
+- For each LFS Log Record within the page (may be multiple per page, may span pages via `flags & 0x01`):
+  - Parse the record header (Appendix D.5) to extract: `this_lsn`, `client_previous_lsn`, `record_type`, `transaction_id`.
+  - Parse the NTFS Client Data to extract: `redo_operation`, `undo_operation`, `redo_offset`, `redo_length`, `target_attribute` type, `lcns_to_follow`, and `lcn_list[]`.
 
-**Step 2 — Semantic Attribute Location:**
-- Rather than applying data at a fixed byte offset, the engine dynamically walks the MFT record's attribute list chain to locate the target attribute by `type + name` (case-insensitive name comparison).
-- **Attribute Not Found:** If the attribute does not exist in the current MFT record (e.g., it was deleted after the log record was written), the engine MUST create a new attribute of the specified type, aligned to an 8-byte boundary.
-- **Attribute Found:** The redo data from the log record is applied at the current physical location of the attribute within the MFT record.
+**Step 2 — Transaction Table Reconstruction:**
+Before replaying, build a Transaction Table by walking log records from `OldestLsn` to `CurrentLsn`:
+- On `CommitTransaction` (opcode `0x1A`): mark transaction as committed.
+- On `ForgetTransaction` (opcode `0x1B`): remove transaction from table.
+- On `PrepareTransaction` (opcode `0x19`): mark as prepared (treat as uncommitted).
+- After the walk: **only committed transactions** are replayed. Uncommitted transactions are rolled back (undo) or simply ignored if undo is disabled.
 
-**Step 3 — Redo Data Application:**
+**Step 3 — Semantic Attribute Location:**
+- For each log record in a committed transaction, resolve the target cluster(s) via `lcn_list[]`.
+- Read the target MFT record or INDX page from disk. Apply USA fixup.
+- Locate the target attribute by `type + name` (case-insensitive name comparison using the volume's `$UpCase` table).
+- **Attribute Not Found:** If the attribute does not exist (e.g., it was deleted after the log record was written), the engine MUST create a new attribute of the specified type, aligned to an 8-byte boundary.
+- **Attribute Found:** Apply the redo operation at the current physical location.
+
+**Step 4 — Redo Data Application (Opcode Dispatch):**
 - **Safety Constraint (CRITICAL):** Before applying redo data, the engine MUST enforce strict bounds checking: `target_offset_within_attr + redo_length ≤ attr_size`. Failing to do so results in buffer overflows and silent corruption of adjacent attributes or the record tail.
-- **Decompression:** If a log record contains the `$Bad` signature, it indicates compression. The payload must be decompressed using `LZNT1` before application.
-- **Replay Order:** The transaction applier processes attribute types in a defined order per record (e.g., `$INDEX_ALLOCATION` before `$DATA`) to maintain referential consistency.
+- **Decompression:** If a log record's redo payload is compressed, it must be decompressed using `LZNT1` (Section 3.9) before application.
+- **Replay Order:** The transaction applier processes log records in strict LSN order. Within a single MFT record update, attribute types are written in order (`$INDEX_ALLOCATION` before `$DATA`) to maintain referential consistency.
 
-**Step 4 — Finalization:**
-- After all log records are replayed, all caches (MFT, Bitmap, Index) must be flushed to disk.
+**Step 5 — Finalization:**
+- After all committed transactions are replayed, all caches (MFT, Bitmap, Index) must be flushed to disk.
+- Write a new Restart Area with `Flags |= CLEAN_DISMOUNT` and updated `CurrentLsn`.
+
+**Complete Redo/Undo Opcode Table (from public NTFS documentation):**
+
+| Opcode | Name | Category | v1.0 Handler |
+| :---: | :--- | :--- | :--- |
+| `0x00` | *Reserved* | — | No-op |
+| `0x01` | `Noop` | Control | No-op |
+| `0x02` | `InitializeFileRecordSegment` | MFT | Generic copy |
+| `0x03` | `DeallocateFileRecordSegment` | MFT | Generic copy |
+| `0x04` | `WriteEndOfFileRecordSegment` | MFT | Generic copy |
+| `0x05` | `CreateAttribute` | Attribute | Generic copy |
+| `0x06` | `DeleteAttribute` | Attribute | Generic copy |
+| `0x07` | `UpdateResidentValue` | Attribute | Generic copy |
+| `0x08` | `UpdateNonresidentValue` | Data | Generic copy |
+| `0x09` | `UpdateMappingPairs` | Data Run | Generic copy |
+| `0x0A` | `DeleteDirtyClusters` | Bitmap | **Specialized** |
+| `0x0B` | `SetNewAttributeSizes` | Attribute | Generic copy |
+| `0x0C` | `AddIndexEntryToRoot` | Index | Generic copy |
+| `0x0D` | `DeleteIndexEntryFromRoot` | Index | Generic copy |
+| `0x0E` | `AddIndexEntryToAllocationBuffer` | Index | Generic copy |
+| `0x0F` | `DeleteIndexEntryFromAllocationBuffer` | Index | Generic copy |
+| `0x10` | `WriteEndOfIndexBuffer` | Index | Generic copy |
+| `0x11` | `SetIndexEntryVcnInRoot` | Index | Generic copy |
+| `0x12` | `SetIndexEntryVcnInAllocationBuffer` | Index | Generic copy |
+| `0x13` | `UpdateFileNameInRoot` | Index | Generic copy |
+| `0x14` | `UpdateFileNameInAllocationBuffer` | Index | Generic copy |
+| `0x15` | `SetBitsInNonResidentBitMap` | Bitmap | Generic copy |
+| `0x16` | `ClearBitsInNonResidentBitMap` | Bitmap | Generic copy |
+| `0x17` | `HotFix` | Repair | **Specialized** |
+| `0x18` | `EndTopLevelAction` | Control | **Specialized** |
+| `0x19` | `PrepareTransaction` | TxControl | **Specialized** |
+| `0x1A` | `CommitTransaction` | TxControl | **Specialized** |
+| `0x1B` | `ForgetTransaction` | TxControl | **Specialized** |
+| `0x1C` | `OpenNonresidentAttribute` | Attribute | **Specialized** |
+| `0x1D` | `OpenAttributeTableDump` | Checkpoint | No-op (restart data) |
+| `0x1E` | `AttributeNamesDump` | Checkpoint | No-op (restart data) |
+| `0x1F` | `DirtyPageTableDump` | Checkpoint | No-op (restart data) |
+| `0x20` | `TransactionTableDump` | Checkpoint | No-op (restart data) |
+| `0x21` | `UpdateRecordDataRoot` | Index | Generic copy |
+| `0x22` | `UpdateRecordDataAllocation` | Index | Generic copy |
+| `0x23` | `UpdateRelativeDataIndex` | Index | Generic copy |
+| `0x24` | `UpdateRelativeDataAllocation` | Index | Generic copy |
+| `0x25` | `ZeroEndOfFileRecord` | MFT | Generic copy |
+
+**v1.0 Handler Categories:**
+- **Generic copy** (23 opcodes): Read `redo_data` from log record. Copy `redo_length` bytes to `redo_offset` within the located attribute. This is the positional copy handler.
+- **No-op** (9 opcodes): `0x00`, `0x01`, `0x1D`–`0x20`. Control/checkpoint records. No disk modification.
+- **Specialized** (5 opcodes): `0x0A`, `0x17`–`0x1C`. Transaction control and non-trivial repair operations. Skipped in v1.0 with `E_JOURNAL_SKIP` warning. See Research Gaps.
+
+> [!NOTE]
+> **Undo is largely disabled during repair.** Black-box analysis confirms that most undo operations in production repair engines are no-ops. This specification follows the same model: the engine is **redo-only forward replay** with no rollback during repair. Uncommitted transactions are simply not replayed — their effects are cleaned up by the subsequent MFT/Bitmap/Index verification phases.
 
 **Implementation Strategy — Semi-Semantic Replay:**
 
 > [!IMPORTANT]
-> Black-box analysis of a proprietary repair engine has confirmed a **hybrid "semi-semantic" opcode dispatch model** — more structured than blind positional patching, less complete than a full opcode interpreter. This informs our recommended implementation strategy.
+> Behavioral observation of existing repair logic has confirmed a **hybrid "semi-semantic" opcode dispatch model** — more structured than blind positional patching, less complete than a full opcode interpreter. This informs our recommended implementation strategy.
 
-**Confirmed Opcode Dispatch Structure (from binary analysis):**
+**Confirmed Opcode Dispatch Structure (from behavioral observation):**
 Three dispatch tables exist within the Journal Replay function:
 - **Table 1** (primary redo): 38 cases on `redo_operation` — dispatches by opcode
 - **Table 2** (undo): 33 cases on `undo_operation` — undo is largely disabled (most are no-ops)
@@ -642,6 +874,10 @@ While this specification outlines the core algorithmic behaviors extracted from 
 All disk I/O MUST go through a single abstraction layer. The contract below defines the minimal required interface:
 
 ```c
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>  /* Required for bool — or use _Bool in strict C99 */
+
 typedef struct io_context {
     /* Identity */
     const char *device_path;       /* "/dev/sda1" or "image.raw" */
@@ -678,7 +914,45 @@ Not all I/O errors are equal. The engine MUST classify `errno` values into three
 A `read()` returning fewer bytes than requested (short read) MUST be treated as a **fatal error**, not retried with an adjusted offset. On block devices, a short read indicates a driver-level fault that will not self-correct. The engine MUST NOT attempt to stitch together partial reads.
 
 **I/O Timeout:**
-Each `read()` and `write()` call MUST be bounded by a timeout (default: 30 seconds). If the underlying block device hangs (e.g., dying HDD controller), the engine MUST detect this via `alarm()` or `ppoll()` timeout and abort with `FATAL: I/O timeout at offset 0x%llx after %d seconds`.
+Each `read()` and `write()` call MUST be bounded by a timeout (default: 30 seconds). If the underlying block device hangs (e.g., dying HDD controller), the engine MUST detect this and abort with `FATAL: I/O timeout at offset 0x%llx after %d seconds`.
+
+> [!WARNING]
+> **Do NOT use `alarm()` / `SIGALRM` for I/O timeouts.** `alarm()` is process-wide (one timer per process). With the Parallel Merge Algorithm (Section 6.1, N worker threads), a later `alarm()` call from thread B silently cancels thread A's timer — leaving thread A blocked indefinitely on a dying disk.
+>
+> **Do NOT use `ppoll()` / `poll()` on block device file descriptors.** On Linux, `poll()` on a block device fd returns `POLLIN` immediately — block devices are always "ready" from poll's perspective (see `poll(2)` man page). The actual blocking occurs inside `pread()`, which ppoll cannot bound. This means `ppoll()` will return `ready = 1`, and the subsequent `pread()` will hang indefinitely on a dying controller.
+
+**Thread-safe timeout implementations (choose one):**
+```c
+// Option 1 (RECOMMENDED): io_uring with linked timeout
+// Linux ≥ 5.5, via liburing. Submits read + IORING_OP_LINK_TIMEOUT
+// as an atomic SQE pair. The kernel cancels the read if the timeout
+// fires first — this works correctly on block devices.
+struct io_uring_sqe *sqe_read = io_uring_get_sqe(&ring);
+io_uring_prep_read(sqe_read, ctx->fd, buf, len, offset);
+sqe_read->flags |= IOSQE_IO_LINK;  // link to next SQE
+
+struct io_uring_sqe *sqe_timeout = io_uring_get_sqe(&ring);
+struct __kernel_timespec ts = { .tv_sec = timeout_sec };
+io_uring_prep_link_timeout(sqe_timeout, &ts, 0);
+
+io_uring_submit(&ring);
+// Wait for CQE — if timeout fires, read CQE has res = -ECANCELED
+
+// Option 2 (PORTABLE FALLBACK): Thread-per-IO watchdog
+// Delegate all I/O to a dedicated worker thread.
+// Main thread waits with pthread_mutex_timedlock().
+// On timeout → pthread_cancel() the I/O thread.
+pthread_create(&io_thread, NULL, io_worker, &io_req);
+struct timespec deadline;
+clock_gettime(CLOCK_REALTIME, &deadline);
+deadline.tv_sec += timeout_sec;
+int rc = pthread_mutex_timedlock(&io_req.done_mutex, &deadline);
+if (rc == ETIMEDOUT) {
+    pthread_cancel(io_thread);  // forcefully abort the blocked pread()
+    log(FATAL, E_IO_TIMEOUT, ...);
+    abort();
+}
+```
 
 **Mock adapter for testing:**
 ```c
@@ -843,7 +1117,7 @@ The following are non-binding but strongly recommended technology choices. They 
 | :--- | :--- | :--- |
 | **LZNT1 Decompression** | `ntfs-3g` / `wimlib` source | Both are LGPL; extractable as standalone modules |
 | **Unicode / $UpCase** | `libunicode` or `icu4c` | For B-Tree collation; `icu4c` preferred for full Unicode 15 support |
-| **Roaring Bitmaps** | [CRoaring](https://github.com/RoaringBitmap/CRoaring) | Apache 2.0; C library with Rust bindings (`roaring`) |
+| **Roaring Bitmaps** | [CRoaring](https://github.com/RoaringBitmap/CRoaring) | Apache 2.0; C library with Rust bindings (`roaring`). C API: `roaring_bitmap_t *`, `roaring_bitmap_add_range()`, `roaring_bitmap_contains()`, `roaring_bitmap_or_inplace()` |
 | **Test Framework (C)** | [Criterion](https://github.com/Snaipe/Criterion) | TAP-compatible, supports fixtures and parameterized tests |
 | **Test Framework (C++)** | Google Test (`gtest`) | Wide community adoption, good mock support |
 | **Fuzzing** | AFL++ + `afl-clang-fast` | Pair with ASan/UBSan; prefer persistent mode for speed |
@@ -1084,7 +1358,7 @@ This prompt MUST be displayed unless `--force` is specified. In `--dry-run` mode
 
 ## Appendix A: Normative References
 
-The following public documents constitute the normative basis for this specification. All structural definitions, field offsets, and behavioral descriptions in this RFC are derived from these sources. No proprietary source code or disassembly was used as a primary reference.
+The following public documents constitute the normative basis for this specification. All structural definitions, field offsets, and behavioral descriptions in this RFC are derived from these sources. No closed-source software or disassembly was used as a primary reference.
 
 | Ref | Title | Source |
 | :-- | :--- | :--- |
@@ -1093,7 +1367,7 @@ The following public documents constitute the normative basis for this specifica
 | [MSDN-EA] | *`FILE_FULL_EA_INFORMATION` structure* | [Microsoft Learn — ntifs.h](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_full_ea_information) |
 | [MSDN-USN] | *`USN_RECORD_V2` structure* | [Microsoft Learn — winioctl.h](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ns-winioctl-usn_record_v2) |
 | [NTFS-COM] | *NTFS Documentation (community)* | [flatcap.org / ntfs.com](https://www.ntfs.com/ntfs-system-files.htm) |
-| [LZNT1] | *LZNT1 Compression Algorithm* | [MS-DRSR §4.1.4](https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-drsr/), and `wimlib` source code |
+| [LZNT1] | *LZNT1 Compression Algorithm* | [MS-XCA §2.5](https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-xca/) (Xpress Compression Algorithm, full normative spec). Also referenced in [MS-DRSR] §4.1.4 and implemented in `wimlib` source code |
 | [ROARING] | *Roaring Bitmaps: A Better Compressed Bitset* | [Chambi et al., 2016 — arXiv:1402.6407](https://arxiv.org/abs/1402.6407) |
 | [AFL++] | *AFL++: Combining Incremental Steps of Fuzzing Research* | [aflplus.plus](https://aflplus.plus/) |
 
@@ -1152,7 +1426,7 @@ This matrix defines the scope of NTFS features that this specification covers, t
 | Object IDs | `$ObjId` | ✅ Full | §4 | MFT_REF validation |
 | $UsnJrnl | `$UsnJrnl` | ⚠️ Advisory | §5.1 | Filename hints only; never structural |
 | EFS (Encryption) | `$LOGGED_UTILITY_STREAM` | ⚠️ Header only | §3.12 | Opaque payload; header validation optional |
-| TxF (Transactional) | `$LOGGED_UTILITY_STREAM` (0x100) | ⚠️ Pass-through | §3.12 | **Confirmed (binary analysis):** no explicit type `0x100` handling. Updated incidentally by generic positional handler only. Deprecated since Win8. |
+| TxF (Transactional) | `$LOGGED_UTILITY_STREAM` (0x100) | ⚠️ Pass-through | §3.12 | **Confirmed (behavioral observation):** no explicit type `0x100` handling. Updated incidentally by generic positional handler only. Deprecated since Win8. |
 | Data Deduplication | (via Reparse) | ⚠️ Preserve only | §3.13 | Stub preserved; chunk store not validated |
 | Bad Sector Handling | `$BadClus` | ✅ Full | §3.8 | Including self-corruption bootstrap |
 | DOS 8.3 Names | `$FILE_NAME` (0x30) | ✅ Full | §3.6 | Collision-aware regeneration |
@@ -1391,3 +1665,46 @@ Offset  Size  Field                           Description
 - `DDF_Offset` MUST be `≥ 0x1C` and `< Length`.
 - `DRF_Offset` MUST be `0` (no DRA) or `≥ 0x1C` and `< Length`.
 - `Version` MUST be `2` or `3`. Unknown versions → treat as opaque.
+
+### D.8 LFS_RESTART_PAGE — Structural Layout
+Located at the beginning of the `$LogFile`. There are two copies (at offset `0x0` and offset `SystemPageSize`).
+
+| Offset | Size | Name | Description |
+| :--- | :--- | :--- | :--- |
+| `0x00` | 8 | `MULTI_SECTOR_HEADER` | Standard NTFS record header. Magic = `RSTR`. |
+| `0x08` | 8 | `ChkDskLsn` | Check Disk LSN (used by `chkdsk`) |
+| `0x10` | 4 | `SystemPageSize` | Size of this restart page (typically 4096) |
+| `0x14` | 4 | `LogPageSize` | Size of `RCRD` pages (typically 4096) |
+| `0x18` | 2 | `RestartOffset` | Offset to the `LFS_RESTART_AREA` (from `0x00`) |
+| `0x1A` | 2 | `MinorVersion` | LFS minor version (e.g., 1) |
+| `0x1C` | 2 | `MajorVersion` | LFS major version (e.g., 1) |
+| `0x1E` | Var | `UpdateSequenceArray`| USA array for fixups |
+
+### D.9 LFS_RESTART_AREA — Structural Layout
+Located within the `LFS_RESTART_PAGE` at `RestartOffset`. Anchors the journal recovery process.
+
+| Offset | Size | Name | Description |
+| :--- | :--- | :--- | :--- |
+| `0x00` | 8 | `CurrentLsn` | The LSN of the current (active) log record |
+| `0x08` | 2 | `LogClients` | Number of `LFS_CLIENT_RECORD` entries |
+| `0x0A` | 2 | `ClientFreeList` | Index of the first free client record |
+| `0x0C` | 2 | `ClientInUseList`| Index of the first in-use client record |
+| `0x0E` | 2 | `Flags` | Bit `0x02` = `CLEAN_DISMOUNT` (volume cleanly unmounted) |
+| `0x10` | 4 | `SeqNumberBits` | Number of bits used for the sequence number portion of LSNs |
+| `0x14` | 2 | `RestartAreaLength`| Total length of this structure including the client array |
+| `0x16` | 2 | `ClientArrayOffset`| Offset from the start of `LFS_RESTART_AREA` to the client array |
+| `0x18` | 8 | `FileSize` | Total size of the `$LogFile` |
+
+### D.10 LFS_CLIENT_RECORD — Structural Layout
+Located within the Restart Area, starting at `ClientArrayOffset`. Typically, NTFS is the only registered client.
+
+| Offset | Size | Name | Description |
+| :--- | :--- | :--- | :--- |
+| `0x00` | 8 | `OldestLsn` | The LSN of the oldest uncommitted record belonging to this client. **Replay starts here.** |
+| `0x08` | 8 | `ClientRestartLsn` | The LSN of the latest restart record |
+| `0x10` | 2 | `PrevClient` | Index of the previous client (or `0xFFFF`) |
+| `0x12` | 2 | `NextClient` | Index of the next client (or `0xFFFF`) |
+| `0x14` | 2 | `SeqNumber` | Client sequence number |
+| `0x16` | 6 | `Padding` | Reserved / Alignment |
+| `0x1C` | 4 | `ClientNameLength` | Length of the client name in bytes |
+| `0x20` | 128 | `ClientName` | Name of the client (UTF-16LE, typically "NTFS") |
