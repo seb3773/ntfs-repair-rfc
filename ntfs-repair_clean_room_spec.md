@@ -35,22 +35,26 @@ The orchestrator must maintain a centralized State Object (Context) throughout e
 
 ### 1.3 Verification Orchestrator (16-Step Pipeline)
 The main verification loop must run in distinct phases to safely rebuild the volume. This strict ordering prevents secondary corruption:
-0. **Boot Sector Validation:** Validate BPB and magic bytes.
-1. **System File Open:** Initialize handlers for metadata files ($MFT, $MFTMirr, $Bitmap, $LogFile).
-2. **AttrDef & $UpCase Loading:** Load attribute definitions and the volume's Unicode uppercase table.
-3. **Journal Replay ($LogFile):** Apply uncommitted log transactions (requires system files to be open).
-4. **MFT Record Verification:** Initial scan to detect orphans and validate headers.
-5. **Zombie Deletion:** Remove empty MFT records (with Anti-Zombie protection).
-6. **Extended Attributes (EA) Verification:** Validate `$EA` blocks.
-7. **System File Creation/Repair:** Rebuild missing fundamental system structures.
-8. **Folder ($I30) Index Verification:** Validate and rebuild directory B-Trees.
-9. **Orphan Recovery:** Relocate severed files to a lost+found directory.
-10. **System File Re-open:** Refresh handlers after structural repairs.
-11. **$Extend Indexes Verification:** Validate `$Quota`, `$ObjId`, and `$Reparse` B-Trees.
-12. **Data Alignment Fix:** Fix metadata alignment (8-byte attribute boundaries).
-13. **Security ($Secure) Verification:** Validate and rebuild `$SII` and `$SDS` trees.
-14. **$Bitmap Verification:** Reconcile actual cluster usage against the volume bitmap.
-15. **$MFTMirr Correction:** Final sync of the primary MFT to its mirror.
+| Phase | Name | Risk Level | Pre-Write Check |
+| :---: | :--- | :---: | :---: |
+| 0 | **Boot Sector Validation** | **HIGH** | ✅ Yes |
+| 1 | **System File Open** ($MFT, $MFTMirr, $Bitmap, $LogFile) | **HIGH** | ✅ Yes |
+| 2 | **AttrDef & $UpCase Loading** | Medium | ✅ Yes |
+| 3 | **Journal Replay** ($LogFile) | **HIGH** | ✅ Yes |
+| 4 | **MFT Record Verification** | **HIGH** | ✅ Yes |
+| 5 | **Zombie Deletion** (Empty records) | Medium | ❌ No |
+| 6 | **Extended Attributes (EA) Verification** | Low | ❌ No |
+| 7 | **System File Creation/Repair** | Medium | ❌ No |
+| 8 | **Folder ($I30) Index Verification** | **HIGH** | ❌ No |
+| 9 | **Orphan Recovery** (to lost+found) | Medium | ❌ No |
+| 10 | **System File Re-open** | Low | ❌ No |
+| 11 | **$Extend Indexes Verification** | Low | ❌ No |
+| 12 | **Data Alignment Fix** | Low | ❌ No |
+| 13 | **Security ($Secure) Verification** | Medium | ❌ No |
+| 14 | **$Bitmap Verification** | **HIGH** | ❌ No |
+| 15 | **$MFTMirr Correction** | **HIGH** | ❌ No |
+
+*Note: A Pre-Write Check of "Yes" indicates that a FATAL error in this phase MUST abort the process before any physical disk writes are permitted.*
 
 **Pipeline Dependency Diagram:**
 
@@ -101,7 +105,26 @@ flowchart TD
     style P15 fill:#16213e,color:#e0e0e0
 ```
 
-### 1.4 Market Context & Capability Comparison
+### 1.4 Operational Modes & Repair Strategies
+
+To accommodate different levels of risk tolerance, the engine defines several operational strategies:
+
+1. **Scan-Only (`--scan`)**: Read-only validation. No writes permitted.
+2. **Dry-Run (`--dry-run`)**: Executes the full pipeline using in-memory Shadow Buffers.
+3. **Minimal Viable Repair (MVR)**: Executes only Phases 0 through 4, plus Phase 14 ($Bitmap) and 15 ($MFTMirr). This subset is sufficient to clear the `dirty` flag and resolve minor corruptions (e.g., USA failures, Bitmap inconsistencies) without risking complex B-Tree or Security Descriptor rebuilds. This is the recommended default for slightly damaged volumes.
+4. **Full Repair (`--apply`)**: Executes the entire 16-phase pipeline with WAL enabled.
+5. **Aggressive Salvage (`--salvage-aggressive`)**: 
+   > [!CAUTION]
+   > **High-Risk Opt-In Mode.** In standard operation, the engine aborts if fundamental structures (like the root $MFT data run) are unreadable. In `--salvage-aggressive` mode, the engine ignores fatal pre-write checks and attempts to carve out surviving files to `found.000/`. This violates strict consistency rules and is strictly a last-resort data extraction mechanism, not a true repair.
+
+### 1.5 Boundaries of Repair: Known Unfixable States
+
+A mature engine must know when to abort. The following states are considered **unfixable** and must trigger a `FATAL` halt (unless `--salvage-aggressive` is active):
+- **Geometry Lost**: Both the primary Boot Sector and its backup are corrupt, missing, or contain contradictory sector/cluster sizing.
+- **Root $MFT Lost**: The Data Run for the primary `$MFT` (record 0) is entirely corrupted AND the `$MFTMirr` (record 1) is also corrupted. The engine cannot locate the volume's metadata.
+- **$LogFile Structure Lost**: The `$LogFile` is marked dirty, but the `LFS_RESTART_AREA` (in both redundancy pages) is unreadable. Replay is impossible, guaranteeing lost transactions.
+
+### 1.6 Market Context & Capability Comparison
 To understand the necessity of this specification, it is crucial to compare the capabilities of the engine described herein against existing open-source utilities. Currently, the Linux/open-source ecosystem lacks a true structural repair tool, relying heavily on basic flag-clearing utilities that cannot salvage severely corrupted trees.
 
 | Feature | This Specification | chkdsk (Windows) | ntfs-3g (ntfsfix) | ntfsprogs (Linux) |
@@ -190,6 +213,11 @@ When the engine requests to read a specific VCN, it MUST NOT parse the raw Data 
 ### 2.5 NTFS Version Detection & Compatibility Matrix
 After reading the Boot Sector, the engine MUST read the NTFS version from the `$Volume` system file (MFT Record 3), specifically the `$VOLUME_INFORMATION` attribute (Type `0xFF`). The `MajorVersion` and `MinorVersion` bytes determine which validation features are applicable.
 
+**Unicode Interoperability & `$UpCase` Fallback:**
+The engine MUST use the volume's native `$UpCase` table (MFT Record 10) for all case-insensitive collation (e.g., sorting `$I30` B-Trees or namespace validation).
+- **Missing Table Fallback:** If the `$UpCase` file is completely destroyed or missing, the engine MUST fall back to a statically compiled Unicode uppercase mapping table to guarantee forward progress. The engine SHOULD log a `WARN`: *"Native $UpCase table lost; using static Unicode fallback."*
+- **Rare Scripts:** Implementations MUST ensure robust collation tests that include rare or complex Unicode scripts (e.g., Georgian, Ethiopian) to verify that case-folding behaves consistently across the entire Unicode range.
+
 | NTFS Version | OS Origin | MFT CRC32 | $UsnJrnl | 8-Byte-Aligned Attrs | Behavior Notes |
 | :--- | :--- | :---: | :---: | :---: | :--- |
 | **1.2** | NT 4.0 / 9x | ❌ | ❌ | ❌ | No CRC32; skip checksum validation step |
@@ -214,6 +242,18 @@ When reading an MFT record, the utility must evaluate its structural integrity:
 - **Strict Fixup Rule (No Heuristics):** When applying the USA fixups to sectors, the engine MUST compare the sector's Update Sequence Number (USN) with the last 2 bytes of the sector. If they do not match, the fixup fails. The engine MUST NOT attempt to guess the missing values, use pattern matching (e.g., `0x0000`), or rebuild it from adjacent sectors. Guessing introduces silent corruption.
 - **Action:** If the USA fixup fails, the engine clears the `IN_USE` bit of the record, effectively declaring it `FREE`, and attempts to reconstruct it by fetching the corresponding record from the `$MFTMirr`. If the mirror record is structurally sound, it is used to repair the corrupt primary `$MFT` record.
   - **Range Limitation Rule (CRITICAL):** The `$MFTMirr` is NOT a complete mirror of the `$MFT`. It typically only contains the first 4 system records (records 0–3). The utility MUST check if the corrupt record ID falls within the mirrored range before attempting a recovery from `$MFTMirr`. For records beyond this range, the `$MFTMirr` is useless, and the record must remain marked as `FREE` and trigger Orphan Recovery.
+
+**MFT Record Repair Decision Matrix:**
+*(Applies to System Records 0–3 where `$MFTMirr` is available. For records > 3, any Structural or Semantic failure results in marking the record `FREE` and triggering Orphan Recovery).*
+
+| Primary State (Struct/Semantic) | Mirror State (Struct/Semantic) | Engine Action |
+| :--- | :--- | :--- |
+| ❌ Struct Fail (USA/CRC) | ✅ Valid / Valid | Copy Mirror → Primary |
+| ❌ Struct Fail (USA/CRC) | ❌ Struct Fail (USA/CRC) | **FATAL** (if record 0) or Mark `FREE` |
+| ✅ Valid / ❌ Semantic Fail | ✅ Valid / ✅ Valid | Copy Mirror → Primary |
+| ✅ Valid / ❌ Semantic Fail | ✅ Valid / ❌ Semantic Fail | Mark `FREE` → Orphan Recovery |
+| ✅ Valid / ✅ Valid | ❌ Struct Fail (USA/CRC) | Copy Primary → Mirror (Phase 15) |
+| ✅ Valid / ✅ Valid | ✅ Valid / ❌ Semantic Fail | Copy Primary → Mirror (Phase 15) |
 
 **Step 2: Final Synchronization (Phase 15)**
 Unlike legacy closed-source utilities that perform a dangerous "Blind Sync" based solely on header integrity, this specification mandates a strict **Semantic Validation Barrier** to prevent "Bit Rot" corruption from overwriting a healthy mirror.
@@ -243,6 +283,11 @@ Unlike legacy closed-source utilities that perform a dangerous "Blind Sync" base
 - The utility then compares the calculated "Ground Truth" buffer against the actual `$Bitmap` read from the disk.
 - **Computed = FREE, Disk = USED:** This indicates a cluster leak ("Free cluster(s) marked as used"). The utility clears the bit on disk to reclaim space.
 - **Computed = USED, Disk = FREE:** This is a severe risk of data overwriting ("Used cluster(s) marked as free"). The utility strictly enforces the computed truth and sets the bit to `USED` on disk.
+
+**Formal Release Barrier (Two-Phase WAL Commit):**
+Before committing the reconciliation to disk (specifically when freeing clusters), the engine MUST enforce a formal safety barrier:
+- **Heuristic Consensus:** The decision to free a massive block of clusters MUST reach a predefined consensus threshold (e.g., 2/3 of heuristic checks passing) to prevent a parser bug from destroying data.
+- **WAL Snapshot:** The engine MUST write the proposed Bitmap changes to the Write-Ahead Log (WAL) and `fsync` the log BEFORE altering the physical `$Bitmap`. This guarantees the operation can be aborted or rolled back if the OS crashes during the massive write operation.
 
 *Note:* This exact same double-pass algorithm is applied to the `$MFT:$BITMAP` during Phase 14, using MFT indexes instead of physical clusters.
 
@@ -1062,12 +1107,17 @@ The following components are highest-risk and MUST be fuzz-tested before any rel
 - **Specific mutation targets:** LCN offset overflow (length nibble `> 8`), zero-length run with non-zero offset, alternating sign-extended offsets producing negative LCNs beyond volume bounds, VCN continuity break (gap or overlap between consecutive runs).
 - **Acceptance:** Zero crashes, zero ASan hits in 20 million iterations.
 
-**Harness 2 — INDX Node Parser (`fuzz_indx_node`):**
-- **Input:** A full 4096-byte INDX node (valid header, fuzzed entry region).
-- **Specific mutation targets:** `IndexEntrySize` of 0 or 1 (infinite loop), `NextEntryOffset` pointing outside node bounds, `FileReference.SequenceNumber` mismatch with MFT, `FileNameLength` causing name read beyond entry end.
-- **Acceptance:** Zero crashes, zero ASan hits in 20 million iterations.
+**Harness 2 — LZNT1 Decompressor (`fuzz_lznt1`):**
+- **Input:** Raw compressed chunk (up to 4096 bytes).
+- **Specific mutation targets:** Decompression bombs, invalid back-reference displacements (pointing before the start of the output buffer), chunk sizes exceeding 4096 bytes, infinite loop triggering flags.
+- **Acceptance:** Strict OOM limits must not trigger; zero buffer over-reads.
 
-**Harness 3 — MFT Record / USA Validator (`fuzz_mft_record`):**
+**Harness 3 — INDX Node Parser (`fuzz_indx_node`):**
+- **Input:** Raw INDX page (4096 bytes).
+- **Specific mutation targets:** `IndexEntrySize` of 0 or 1 (infinite loop), `NextEntryOffset` pointing outside node bounds, extreme entry lengths, circular VCN pointers, mismatched MFT parent references, invalid USA fixup arrays.
+- **Acceptance:** Zero crashes, zero ASan hits in 20 million iterations. Parser must cleanly reject malformed trees without recursive stack exhaustion.
+
+**Harness 4 — MFT Record / USA Validator (`fuzz_mft_record`):**
 - **Input:** A 1024-byte MFT record buffer.
 - **Specific mutation targets:** USA array size `> 3` (too large), USA sequence numbers that partially match (one sector ok, one not), CRC32 matching header but corrupt attribute body, attribute type `0xFFFFFFFF` (end marker) appearing at offset 0, `AttributeLength` causing a negative remaining space.
 - **Acceptance:** Zero crashes, zero ASan hits in 20 million iterations.
@@ -1271,7 +1321,13 @@ int64_t delta = (int64_t)(int8_t)last_byte << 56;
 
 This section documents the visible effects that a repair performed by this tool will have when the volume is subsequently mounted under Windows. These are **not bugs** — they are necessary consequences of offline structural repair. They MUST be communicated to end users via documentation and CLI warnings.
 
-### 7.1 Effects Visible to End Users After Repair
+### 7.1 Interoperability Limits (Unsupported Environments)
+
+This engine operates strictly on the NTFS structural level. It is fundamentally incompatible with OS-level virtualization or encryption layers that obscure the raw blocks:
+- **BitLocker:** Volumes encrypted with BitLocker MUST be decrypted (using `dislocker` or `bdeinfo`) and mapped as a cleartext block device before repair. Repairing the raw ciphertext blocks will permanently destroy the encryption container.
+- **Windows Storage Spaces (WSS):** This tool cannot repair the underlying Storage Spaces abstraction. It can only run on the final, logically assembled volume exposed by the WSS driver.
+
+### 7.2 Effects Visible to End Users After Repair
 
 | Effect | Cause | User Impact | Mitigation |
 | :--- | :--- | :--- | :--- |
@@ -1343,16 +1399,17 @@ The engine MUST display the following warnings before any `--apply` execution:
 === WARNING: DESTRUCTIVE OPERATION ===
 The following irreversible side-effects will occur:
   1. All Volume Shadow Copies (Previous Versions) will be INVALIDATED.
-  2. EFS-encrypted files with corrupt key metadata will become UNDECRYPTABLE.
-  3. The $UsnJrnl change journal may be RESET.
-  4. Deduplicated file stubs with corrupt reparse points will become UNRESOLVABLE.
+  2. The $Bitmap may undergo massive reconstruction. Ensure you have a RAW IMAGE BACKUP.
+  3. EFS-encrypted files with corrupt key metadata will become UNDECRYPTABLE.
+  4. The $UsnJrnl change journal may be RESET.
+  5. Deduplicated file stubs with corrupt reparse points will become UNRESOLVABLE.
 
 A Write-Ahead Log will be created at: /tmp/ntfsrepair_wal_<volume_serial>.dat
 This log enables crash recovery if the repair is interrupted.
 
 Proceed with repair? [y/N]
 ```
-This prompt MUST be displayed unless `--force` is specified. In `--dry-run` mode, the same effects are listed as "WOULD occur" in past tense in the final report.
+This explicit consent prompt MUST be displayed unless `--force` is specified. In `--dry-run` mode, the same effects are listed as "WOULD occur" in past tense in the final report.
 
 ---
 

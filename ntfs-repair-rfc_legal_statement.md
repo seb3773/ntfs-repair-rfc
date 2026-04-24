@@ -23,10 +23,14 @@ The specific algorithms detailed in this specification (such as B-Tree node spli
 - To successfully fix cross-linked clusters, one *must* compute the ground truth of cluster allocations from the Master File Table (MFT).
 - **Defense Pillar:** Under the "Merger Doctrine" (Scènes à faire), when there are only a limited number of ways to express an idea or achieve a functional requirement, that expression cannot be copyrighted. The described repair mechanisms are functional necessities, not creative expressions.
 
-## 4. The Clean Room Barrier
+## 4. The Clean Room Barrier (Absolute Air Gap Pledge)
 This specification acts as the legal "Chinese Wall" between the analysis phase and the implementation phase.
-- **The Analyst:** The author of this specification performed the behavioral observations but will not write the final open-source C/C++ code.
-- **The Implementer:** The developers writing the open-source filesystem driver will only have access to this abstract, high-level English RFC. They will have no exposure to the third-party binaries, assembly traces, or memory dumps.
+
+To ensure absolute legal safety and isolation, I, **seb3773** (the analyst and author of this specification), formally declare and affirm on my honor that:
+1. **No Code Authoring:** I will **never** write, contribute to, or review any source code for an open-source NTFS repair utility derived from this specification.
+2. **No Raw Data Sharing:** I will **never** provide, share, or publish the raw analysis elements, memory dumps, strace logs, or behavioral observations that allowed me to write this specification to any developer, under any circumstances.
+
+- **The Implementer:** The developers writing the open-source filesystem driver will only have access to this abstract, high-level English RFC. They will have no exposure to the analyst, the original tools, or any raw analytical data.
 
 ## Conclusion
 This specification is an independent, original work of technical documentation. It provides a blueprint for achieving NTFS filesystem interoperability and repair in the open-source ecosystem, fully compliant with international copyright and interoperability laws.

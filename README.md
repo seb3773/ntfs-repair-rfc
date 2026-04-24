@@ -54,17 +54,17 @@ This specification was developed under a strict **Clean Room** methodology to en
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    INFORMATION BARRIER                      │
+│                    INFORMATION BARRIER                       │
 │                                                             │
-│  ✅ ALLOWED SOURCES               ❌ FORBIDDEN SOURCES      │
-│  ─────────────────                ────────────────────      │
-│  • [MS-NTFS] public spec         • Windows source code      │
-│  • MSDN / Microsoft Learn        • chkdsk.exe disassembly   │
-│  • ntfs.com documentation        • NTFS.sys decompilation   │
-│  • Academic papers               • Leaked code / NDA docs   │
-│  • Black-box I/O observation     • Proprietary headers      │
-│  • Controlled corruption tests   • Internal Microsoft docs  │
-│  • Public WDK headers (ntifs.h)  • Third-party NDA tools    │
+│  ✅ ALLOWED SOURCES              ❌ FORBIDDEN SOURCES       │
+│  ─────────────────               ────────────────────       │
+│  • [MS-NTFS] public spec        • Windows source code       │
+│  • MSDN / Microsoft Learn       • chkdsk.exe disassembly    │
+│  • ntfs.com documentation       • NTFS.sys decompilation    │
+│  • Academic papers               • Leaked code / NDA docs    │
+│  • Black-box I/O observation     • Proprietary headers       │
+│  • Controlled corruption tests   • Internal Microsoft docs   │
+│  • Public WDK headers (ntifs.h)  • Third-party NDA tools     │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -180,24 +180,24 @@ flowchart TD
 
 ### Phase Summary
 
-| Phase | Name | Key Operations | Section |
-| :---: | :--- | :--- | :---: |
-| 0 | Boot Sector Sync | Bidirectional primary/backup sync, field-level correction, MFT record size parsing | §2.1 |
-| 1 | System File Open | Initialize I/O context, open $MFT, $MFTMirr, $Bitmap, $LogFile | §2 |
-| 2 | AttrDef + $UpCase | Load attribute definitions, load volume's own Unicode uppercase table | §2.5 |
-| 3 | Journal Replay | RSTR/RCRD parsing, semi-semantic redo dispatch (23 generic + 7 specialized opcodes) | §5 |
-| 4 | MFT Verification | USA fixup, CRC32 validation (NTFS 3.1+), mirror recovery, $ATTRIBUTE_LIST rebuild | §3.1, §3.4 |
-| 5 | Zombie Deletion | Remove empty records — with Anti-Zombie protection for dirs, EA, and EFS files | §4 |
-| 6 | EA Verification | 5-rule chain validation, joint `$EA`+`$EA_INFORMATION` deletion on corruption | §3.11 |
-| 7 | System File Rebuild | Reconstruct missing system metadata structures | §3 |
-| 8 | $I30 Index Rebuild | 4-level strategy: MFT sweep → $UpCase sort → B-Tree build → Orphan INDX scan | §4 |
-| 9 | Orphan Recovery | Re-link valid unindexed files to `found.000/`, with USN Journal filename hints | §4, §5.1 |
-| 10 | System File Re-open | Refresh handlers after structural repairs | — |
-| 11 | $Extend Indexes | Validate $Quota ($O/$Q), $ObjId ($O), $Reparse index entries | §4 |
-| 12 | Data Alignment Fix | Ensure 8-byte attribute alignment in MFT records | — |
-| 13 | $Secure Verification | Walk $SDS, verify hashes, cross-check $SII and $SDH indexes | §4 |
-| 14 | $Bitmap Verification | Double-pass Ground Truth construction + Bit-by-bit reconciliation | §3.3 |
-| 15 | $MFTMirr Final Sync | Semantic Validation Barrier + mirror commit | §3.1 |
+| Phase | Name | Risk Level | Pre-Write Check |
+| :---: | :--- | :---: | :---: |
+| 0 | **Boot Sector Validation** | **HIGH** | ✅ Yes |
+| 1 | **System File Open** ($MFT, $MFTMirr, $Bitmap, $LogFile) | **HIGH** | ✅ Yes |
+| 2 | **AttrDef & $UpCase Loading** | Medium | ✅ Yes |
+| 3 | **Journal Replay** ($LogFile) | **HIGH** | ✅ Yes |
+| 4 | **MFT Record Verification** | **HIGH** | ✅ Yes |
+| 5 | **Zombie Deletion** (Empty records) | Medium | ❌ No |
+| 6 | **Extended Attributes (EA) Verification** | Low | ❌ No |
+| 7 | **System File Creation/Repair** | Medium | ❌ No |
+| 8 | **Folder ($I30) Index Verification** | **HIGH** | ❌ No |
+| 9 | **Orphan Recovery** (to lost+found) | Medium | ❌ No |
+| 10 | **System File Re-open** | Low | ❌ No |
+| 11 | **$Extend Indexes Verification** | Low | ❌ No |
+| 12 | **Data Alignment Fix** | Low | ❌ No |
+| 13 | **Security ($Secure) Verification** | Medium | ❌ No |
+| 14 | **$Bitmap Verification** | **HIGH** | ❌ No |
+| 15 | **$MFTMirr Correction** | **HIGH** | ❌ No |
 
 ---
 
@@ -220,13 +220,15 @@ When a structure is corrupt beyond reliable reconstruction, the engine **deletes
 
 Every disk write in `--apply` mode goes through a **Write-Ahead Log** (WAL) with CRC32 verification. A power loss at any point during repair can be recovered on the next startup — either by rolling forward pending writes or detecting external modification.
 
-### 4. Three Operational Modes
+### 4. Five Operational Modes
 
-| Mode | Flag | Reads Disk | Modifies Disk | WAL |
-| :--- | :--- | :---: | :---: | :---: |
-| **Scan** | `--scan` | ✅ | ❌ | ❌ |
-| **Dry-Run** | `--dry-run` | ✅ | ❌ (Shadow Buffers only) | ❌ |
-| **Repair** | `--apply` | ✅ | ✅ | ✅ |
+| Mode | Flag | Reads Disk | Modifies Disk | Description |
+| :--- | :--- | :---: | :---: | :--- |
+| **Scan** | `--scan` | ✅ | ❌ | Read-only structural validation. |
+| **Dry-Run** | `--dry-run` | ✅ | ❌ | Full pipeline using in-memory Shadow Buffers. |
+| **Minimal (MVR)** | `--mvr` | ✅ | ✅ | Executes safe core phases (0-4, 14-15) to clear dirty flag. |
+| **Repair** | `--apply` | ✅ | ✅ | Full 16-phase pipeline with WAL. |
+| **Salvage** | `--salvage-aggressive` | ✅ | ✅ | ⚠️ Ignores fatal checks to carve out files (High Risk). |
 
 ### 5. No TRIM During Repair
 
@@ -305,6 +307,10 @@ The specification mandates:
 - **`seccomp-bpf`** syscall whitelist in production
 - **Phase-based 5-minute watchdog** timeout
 - **OCI container** isolation for CI testing
+
+### Automated Test Corpus (`test-corpus/`)
+
+This project includes an automated suite for generating deterministic NTFS corruption images (`generate_test_corpus.sh`) and its associated reference documentation (`test_corpus_reference.md`). This ensures that developers can continuously test their implementations against the exact edge-cases described in the RFC without risking live data.
 
 ---
 

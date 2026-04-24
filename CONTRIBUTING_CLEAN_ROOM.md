@@ -8,7 +8,7 @@ Because this project is built upon a strict **Clean Room (Chinese Wall) Reverse 
 To contribute code, architecture, or bug fixes to this project, you **MUST** meet the following criteria:
 - You have **NEVER** had access to the source code of Microsoft Windows `chkdsk.exe`, NTFS.sys, or any related Microsoft proprietary filesystem drivers (e.g., through employment, leaked source code, or NDA agreements).
 - You have **NEVER** reverse-engineered, disassembled, or decompiled Microsoft `chkdsk.exe` or any other proprietary third-party NTFS repair utilities.
-- You agree to base your code implementations **exclusively** on the official `chkufsd_clean_room_spec.md` RFC provided in this repository, standard public NTFS documentation (such as Linux NTFS-3G wiki), and your own general programming knowledge.
+- You agree to base your code implementations **exclusively** on the official `ntfs-repair_clean_room_spec.md` RFC provided in this repository, standard public NTFS documentation (such as Linux NTFS-3G wiki), and your own general programming knowledge.
 
 *If you do not meet all of the above criteria, please do not submit Pull Requests to this repository.*
 
