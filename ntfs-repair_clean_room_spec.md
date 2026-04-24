@@ -42,6 +42,7 @@ When facing ambiguous corruption, implementers must adhere to the following rule
 1. **[DESIGN CHOICE] No Risky Heuristics:** The engine MUST NOT attempt to guess, probabilistically reconstruct, or pattern-match missing data (e.g., Update Sequence Arrays).
 2. **[DESIGN CHOICE] No Data Migration:** The engine MUST NOT attempt complex, interruptible optimizations like migrating attributes between Resident and Non-Resident states.
 3. **[DESIGN CHOICE] Deletion Over Dubious Repair:** If an attribute or index structure is fundamentally corrupted and cannot be rebuilt from a guaranteed ground truth, the engine MUST delete the structure and fall back to Orphan Recovery rather than attempting a partial or blind patch. A missing file is preferable to a cross-linked cluster chain that overwrites another file later.
+   - **User Communication & Metadata Export:** Because this policy can surprise users (resulting in the sudden loss of EFS streams, EA attributes, or Reparse Points), the engine MUST implement an export mechanism (e.g., `--export-metadata <dir>`). When deleting complex attributes, the engine SHOULD dump the raw, unparseable attribute payload to the export directory with a structured JSON log. This facilitates offline forensic carving or manual audit without risking in-place filesystem corruption.
 4. **[NTFS STANDARD] Endianness Ambiguity:** The NTFS format is strictly Little-Endian. All multi-byte structures MUST be parsed as Little-Endian regardless of the host architecture. Implementers compiling for Big-Endian systems MUST use byte-swapping macros (e.g., `le32_to_cpu`) to avoid instantaneous volume corruption.
 
 ### 1.3 Main Engine Object & State Management
@@ -269,7 +270,7 @@ After reading the Boot Sector, the engine MUST read the NTFS version from the `$
 
 **Unicode Interoperability & `$UpCase` Fallback:**
 The engine MUST exclusively use the volume's native `$UpCase` table (MFT Record 10) for all case-insensitive collation (e.g., sorting `$I30` B-Trees or namespace validation). The engine MUST NOT use the host operating system's Unicode tables (e.g., glibc or system ICU), as these may differ from the specific Unicode version used when the volume was formatted. Sorting an `$I30` B-Tree with the wrong collation table will render files invisible to Windows.
-- **Missing Table Fallback:** If the `$UpCase` file is completely destroyed or missing, the engine MUST fall back to a statically compiled Unicode uppercase mapping table that matches standard NTFS behavior to guarantee forward progress. The engine SHOULD log a `WARN`: *"Native $UpCase table lost; using static Unicode fallback."*
+- **Missing Table Fallback Strategy:** If the `$UpCase` file is completely destroyed or missing, the engine MUST fall back to a statically compiled Unicode uppercase mapping table that explicitly mimics standard Windows/NTFS NT-era binary mappings (e.g. Windows 10 fallback). To prevent silent semantic corruption (which makes files "invisible" to Windows), the engine MUST log a `WARN_UPCASE_FALLBACK`: *"Native $UpCase table lost; using static Windows 10 Unicode fallback mapping. Uncommon Unicode filenames may be sorted incorrectly."*
 - **Rare Scripts:** Implementations MUST ensure robust collation tests that include rare or complex Unicode scripts (e.g., Georgian, Ethiopian) to verify that case-folding behaves consistently across the entire Unicode range.
 
 | NTFS Version | OS Origin | MFT CRC32 | $UsnJrnl | 8-Byte-Aligned Attrs | Behavior Notes |
@@ -347,7 +348,11 @@ Unlike legacy closed-source utilities that perform a dangerous "Blind Sync" base
 
 **Formal Release Barrier (Two-Phase WAL Commit):**
 Before committing the reconciliation to disk (specifically when freeing clusters), the engine MUST enforce a formal safety barrier:
-- **Heuristic Consensus:** The decision to free a massive block of clusters MUST reach a predefined consensus threshold (e.g., 2/3 of heuristic checks passing) to prevent a parser bug from destroying data.
+- **Heuristic Consensus (Massive Freeing):** If the Ground Truth indicates that a massive block (e.g., > 5% of the volume) should be freed, it MUST reach a predefined consensus threshold based on a closed list of indicators to prevent a parser bug from destroying data. The checks are:
+  1. *EIO Threshold:* The percentage of hard I/O read errors during Phase 1 MUST be `< 0.1%`.
+  2. *MFT Record Yield:* The number of valid `FILE` records parsed MUST be `> 90%` of the expected count (from `$MFT:$BITMAP`).
+  3. *Lost Cluster Ratio:* The volume of "Disk=USED, Computed=FREE" clusters MUST NOT exceed `10%` of the total volume size.
+  If ≥ 2 of these 3 fail, the engine MUST abort the `FREE` operation and throw `ERR_CONSENSUS_FAILED`. This logic MUST be rigorously validated with dedicated unit tests feeding simulated corrupted Ground Truths.
 - **WAL Snapshot:** The engine MUST write the proposed Bitmap changes to the Write-Ahead Log (WAL) and `fsync` the log BEFORE altering the physical `$Bitmap`. This guarantees the operation can be aborted or rolled back if the OS crashes during the massive write operation.
 
 *Note:* This exact same double-pass algorithm is applied to the `$MFT:$BITMAP` during Phase 14, using MFT indexes instead of physical clusters. **Crucial Cap:** The Ground Truth for `$MFT:$BITMAP` MUST be capped to the actual number of allocated MFT records (derived from the `$MFT` Data Run total size). If the engine does not explicitly bound the bitmap checks to this maximum record count, it will throw off-by-N errors or falsely detect "lost" records beyond the MFT's physical allocation.
@@ -1005,6 +1010,12 @@ While this specification outlines the core algorithmic behaviors extracted from 
 | 64 TB | 64 KB | 1.07 B | 128 MB | ~16 MB | ~30 M |
 
 *Roaring Bitmap estimates assume typical filesystem occupancy of 60–80%. Sparse volumes (mostly empty) compress dramatically better.*
+
+**Low-Memory / Streaming Mode:**
+To support modest hardware (e.g. 2GB RAM repairing a 16TB volume), the engine SHOULD implement a `--low-memory` flag. In this mode:
+- The engine abandons building the full volume Ground Truth in memory.
+- Instead, it streams the physical `$Bitmap` in chunks (e.g., 256MB regions). For each region, it scans the MFT sequentially, applying Data Runs that overlap with the current region to a temporary Roaring Bitmap, validating the region, flushing it, and then discarding the memory to process the next chunk.
+- **Trade-off:** This is an O(N × M) operation (N regions × M MFT records) causing massive I/O read amplification, but it guarantees bounds on RAM usage (< 50MB).
 
 **Parallel Merge Algorithm for >10 TB Volumes:**
 1. **Shard:** Divide the MFT into N segments (N = number of CPU cores, or `total_mft_records / 100,000`, whichever is smaller).
