@@ -3,7 +3,7 @@
 **Project Status:** Clean Room Functional Specification  
 **Subject:** Advanced NTFS File System Repair Algorithms  
 
-This document serves as the formal legal framework and methodology declaration for the `chkufsd_clean_room_spec.md` Request for Comments (RFC) and any subsequent open-source implementations derived from it.
+This document serves as the formal legal framework and methodology declaration for the `ntfs-repair_clean_room_spec.md` Request for Comments (RFC) and any subsequent open-source implementations derived from it.
 
 ## 1. Zero Contamination from Microsoft's `chkdsk`
 It is hereby explicitly declared that **no analysis, reverse engineering, decompilation, or observation of Microsoft's proprietary `chkdsk.exe` utility (or any of its associated DLLs/drivers) has ever been performed** during the creation of this specification.
