@@ -38,7 +38,7 @@ This is a **specification-only repository**. It contains no executable code. It 
 
 | Document | Purpose |
 | :--- | :--- |
-| [`ntfs-repair_clean_room_spec.md`](ntfs-repair_clean_room_spec.md) | **Main RFC** — 1400+ lines covering the complete 16-phase repair pipeline, all NTFS structures, repair policies, binary format schemas, API contracts, and 11 implementation pitfalls |
+| [`ntfs-repair_clean_room_spec.md`](ntfs-repair_clean_room_spec.md) | **Main RFC** — 1700+ lines covering the complete 16-phase repair pipeline, all NTFS structures, repair policies, binary format schemas, API contracts, and 11 implementation pitfalls |
 | [`ntfs-repair_pseudocode_reference.md`](ntfs-repair_pseudocode_reference.md) | **Pseudo-code companion** — Implementable algorithms for every critical phase: Boot Sector sync, Data Run decoding, USA fixup, Bitmap double-pass, B-Tree rebuild, Journal replay, orphan recovery, WAL crash recovery |
 | [`ntfs-repair-rfc_legal_statement.md`](ntfs-repair-rfc_legal_statement.md) | **Legal declaration** — Formal clean room certification documenting the information barrier |
 | [`CONTRIBUTING_CLEAN_ROOM.md`](CONTRIBUTING_CLEAN_ROOM.md) | **Contribution rules** — Requirements for contributors to maintain legal cleanliness |
@@ -54,17 +54,17 @@ This specification was developed under a strict **Clean Room** methodology to en
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    INFORMATION BARRIER                      │
+│                    INFORMATION BARRIER                       │
 │                                                             │
 │  ✅ ALLOWED SOURCES              ❌ FORBIDDEN SOURCES       │
 │  ─────────────────               ────────────────────       │
-│  • [MS-NTFS] public spec         • Windows source code      │
-│  • MSDN / Microsoft Learn        • chkdsk.exe disassembly   │
-│  • ntfs.com documentation        • NTFS.sys decompilation   │
-│  • Academic papers               • Leaked code / NDA docs   │
-│  • Black-box I/O observation     • Proprietary headers      │
-│  • Controlled corruption tests   • Internal Microsoft docs  │
-│  • Public WDK headers (ntifs.h)  • Third-party NDA tools    │
+│  • [MS-NTFS] public spec        • Windows source code       │
+│  • MSDN / Microsoft Learn       • chkdsk.exe disassembly    │
+│  • ntfs.com documentation       • NTFS.sys decompilation    │
+│  • Academic papers               • Leaked code / NDA docs    │
+│  • Black-box I/O observation     • Proprietary headers       │
+│  • Controlled corruption tests   • Internal Microsoft docs   │
+│  • Public WDK headers (ntifs.h)  • Third-party NDA tools     │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
