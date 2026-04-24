@@ -26,6 +26,7 @@ This specification outlines the architecture and algorithms required to build an
 It is critical to distinguish between **Repair (fsck)** and **Data Recovery (carving)**.
 - **Repair (This Specification):** The goal is to restore the mathematical and structural consistency of the NTFS volume so it can be safely mounted read-write by the host OS. If an index cannot be perfectly rebuilt, it is deleted to preserve the integrity of the surviving B-Tree.
 - **Recovery (Out of Scope):** Opportunistic data extraction (e.g., scraping disk sectors for JPEGs or piecing together broken MFT records to save a single file).
+- **NTFS 1.2 (Out of Scope):** Volumes formatted with NTFS 1.2 (Windows NT 4.0 and earlier) use significantly different internal structures and lack modern attributes like `$Secure`. This specification explicitly excludes NTFS 1.2. The engine MUST read the `major_version` in the `$Volume` file (or boot sector hints); if `major_version < 3`, the engine MUST abort with `ERR_NTFS_VERSION_UNSUPPORTED`.
 
 If a structure cannot be cleanly repaired, it is not the engine's job to perform heroics; the engine will drop the structure to save the filesystem. **A filesystem repair engine is not expected to maximize data recovery, but to restore structural integrity. These goals are often in conflict.** Users needing data extraction from a fundamentally broken drive should use tools like TestDisk or PhotoRec *before* attempting structural repair.
 
@@ -821,7 +822,13 @@ The `$Extend\$ObjId` file contains a single `$O` index:
 **Orphan Recovery & Zombie Deletion (Phases 5 & 9):**
 If index entries are permanently lost during the rebuild, the targeted files will lose their directory links. 
 - **Zombie Deletion (Phase 5) - VULNERABILITY FIX:** Naïve implementations may aggressively delete "Zombie" MFT records (`IN_USE=1`) if they lack a primary `$DATA` (`0x80`) attribute. **This is a fatal structural flaw.** It silently deletes valid empty directories and files that store data exclusively in `$EA` (Extended Attributes, `0x64`) or `$LOGGED_UTILITY_STREAM` (`0xA0`).
-  - **Open-Source Rule:** The engine MUST NOT delete a record simply because `$DATA` is missing. A record is only a "Zombie" (and eligible for deletion) if it lacks a `$DATA` attribute AND lacks an `$INDEX_ROOT` attribute (`0x0B`) AND lacks any `$EA` or utility streams (specifically `$LOGGED_UTILITY_STREAM` which is critical for EFS-encrypted files). System files (MFT IDs 0-15) and records with the `IS_DIRECTORY` (`0x02`) flag MUST never be deleted under this rule.
+  - **Open-Source Rule (Proof of Life):** The engine MUST NOT delete a record simply because `$DATA` is missing. A record is only a "Zombie" (and eligible for deletion) if it fails to contain at least one of the following "Proof of Life" attributes:
+    - `$DATA` (`0x80`)
+    - `$INDEX_ROOT` (`0x90`)
+    - `$EA` (`0x60`)
+    - `$LOGGED_UTILITY_STREAM` (`0x100`)
+    - `$ATTRIBUTE_LIST` (`0x20`) (if it is a valid child record)
+  System files (MFT IDs < 16) and records with the `IS_DIRECTORY` (`0x02`) flag MUST never be deleted under this rule.
 - **Recovered Orphans (Phase 9):** If a valid MFT record has no parent directory pointing to it (or its parent's index is destroyed), it is an Orphan.
   - **Action:** The engine must re-link "Recovered Orphans" to a recovery directory (`found.000` or similar).
   - **Anti-Demotion Rule (CRITICAL):** When relinking an orphaned directory into the recovery folder, the engine MUST NOT clear its `IS_DIRECTORY` bit. A recovered directory must retain its directory structure and contents.
@@ -850,7 +857,10 @@ The `$LogFile` begins with two Restart Pages (at offset 0 and offset `SystemPage
 - Starting from `OldestLsn`, walk `RCRD` pages sequentially. Apply USA fixup to each page.
 - For each LFS Log Record within the page (may be multiple per page, may span pages via `flags & 0x01`):
   - Parse the record header (Appendix D.5) to extract: `this_lsn`, `client_previous_lsn`, `record_type`, `transaction_id`.
-  - Parse the NTFS Client Data (starting at offset 0x30 from the LFS record). The engine MUST parse it as follows:
+  - Parse the NTFS Client Data. The exact start offset depends on the LFS `major_version` read from the Restart Page:
+    - If `major_version == 1` (Windows XP/7), the client data starts at offset `0x28` from the LFS record.
+    - If `major_version == 2` (Windows 8/10/11), it starts at offset `0x30` due to extended padding.
+    Failure to adjust this offset correctly will result in misaligned opcode parsing and catastrophic journal corruption. The engine MUST parse the client data as follows:
     1. Read fixed header (0x00–0x1F) to get `lcns_to_follow`.
     2. If `lcns_to_follow > 0`, read N * 8 bytes for LCN array.
     3. The `redo_data` immediately follows the LCN array (if any), or directly after the fixed header if `lcns_to_follow == 0`.
@@ -1030,6 +1040,10 @@ To support modest hardware (e.g. 2GB RAM repairing a 16TB volume), the engine SH
 3. **Reduce:** When all workers complete, merge bitmaps into a master bitmap.
    - **Data Race Protection:** Do NOT use `roaring_bitmap_or_inplace()` across multiple threads on the same target bitmap, as it mutates the source destructively and causes a data race. The engine MUST perform a two-pass reduction or safely use `roaring_bitmap_or()` (which creates a new bitmap) under proper lock boundaries.
 4. **Memory Bound:** Peak memory = `N * per_thread_bitmap + 1 * master_bitmap`. For a 16 TB volume with 8 threads: ~64 MB × 8 + 64 MB = **576 MB** peak. This fits comfortably in a server with 2+ GB RAM.
+
+> [!TIP]
+> **Alternative: Flat Memory-Mapped Bitmap (Reduced Attack Surface)**
+> While Roaring Bitmaps provide excellent compression, they introduce an external C dependency (`CRoaring`) which increases the attack surface against maliciously crafted volumes. Since a 1TB volume requires exactly 32MB of RAM for a flat uncompressed bitmap, implementers MAY opt for a flat `malloc()` or `mmap()` array for volumes under 16TB (requiring ~512MB RAM). This eliminates the third-party dependency and completely prevents complex buffer overflows within the compression parser, trading O(1) memory overhead for maximum parsing security.
 
 **MFT Caching Layer (LRU):**
 For very large volumes (e.g., >10TB), reading the MFT sequentially during each phase will cause extreme performance degradation. The engine MUST implement an LRU (Least Recently Used) cache for MFT records.
@@ -1477,33 +1491,53 @@ If `chkdsk` reports errors after our repair, this constitutes a **release-blocki
 # chkdsk_roundtrip.sh — Requires: qemu-img, qemu-system-x86_64, Windows Server VHD
 set -euo pipefail
 
-IMAGE="$1"                         # repaired NTFS image (raw)
-WIN_VHD="/ci/windows-server.vhdx"  # pre-configured Windows VM
-DRIVE_LETTER="E"                   # drive letter assigned in VM
+IMAGE="${1:-}"
+WIN_VHD="${WIN_VHD:-/ci/windows-server.vhdx}"
+DRIVE_LETTER="${DRIVE_LETTER:-E}"
+WINRM_PORT="${WINRM_PORT:-5985}"
 TIMEOUT_SEC=120
+
+if [ -z "$IMAGE" ]; then
+    echo "Usage: $0 <repaired_ntfs.img>"
+    exit 1
+fi
 
 # 1. Attach repaired image as secondary disk in QEMU
 qemu-img convert -f raw -O qcow2 "$IMAGE" /tmp/test_ntfs.qcow2
 qemu-system-x86_64 -m 4G -hda "$WIN_VHD" -hdb /tmp/test_ntfs.qcow2 \
     -nographic -serial mon:stdio \
-    -net user,hostfwd=tcp::5985-:5985 &
+    -net user,hostfwd=tcp::${WINRM_PORT}-:5985 &
 QEMU_PID=$!
-sleep 60  # wait for Windows boot
 
-# 2. Run chkdsk via WinRM (PowerShell remoting)
+# 2. Robust WinRM Polling Loop (Wait for Windows boot)
+echo "Waiting for WinRM to become available..."
+MAX_ATTEMPTS=60
+ATTEMPT=0
+until pwsh -Command "Test-WSMan -ComputerName localhost -Port ${WINRM_PORT}" &>/dev/null; do
+    ATTEMPT=$((ATTEMPT + 1))
+    if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+        echo "FATAL: WinRM timeout after ${MAX_ATTEMPTS} seconds."
+        kill $QEMU_PID 2>/dev/null || true
+        exit 1
+    fi
+    sleep 2
+done
+
+# 3. Run chkdsk via WinRM (PowerShell remoting)
+echo "WinRM connected. Executing chkdsk..."
 CHKDSK_OUTPUT=$(timeout $TIMEOUT_SEC pwsh -Command "
-    Invoke-Command -ComputerName localhost -Port 5985 -ScriptBlock {
+    Invoke-Command -ComputerName localhost -Port ${WINRM_PORT} -ScriptBlock {
         chkdsk ${DRIVE_LETTER}: /scan 2>&1
     }
-")
+" || echo "CHKDSK_CRASH_OR_TIMEOUT")
 
-# 3. Validate output
+# 4. Validate output
 kill $QEMU_PID 2>/dev/null || true
 if echo "$CHKDSK_OUTPUT" | grep -qi 'found no problems'; then
     echo "PASS: chkdsk round-trip succeeded"
     exit 0
 else
-    echo "FAIL: chkdsk reported errors:"
+    echo "FAIL: chkdsk reported errors or crashed:"
     echo "$CHKDSK_OUTPUT"
     # Save for regression corpus
     cp "$IMAGE" "/ci/regression/$(date +%Y%m%d)_roundtrip_fail.raw"
@@ -1532,6 +1566,19 @@ This log enables crash recovery if the repair is interrupted.
 Proceed with repair? [y/N]
 ```
 This explicit consent prompt MUST be displayed unless `--force` is specified. In `--dry-run` mode, the same effects are listed as "WOULD occur" in past tense in the final report.
+
+### 7.4 Security Fuzzing Strategy (AFL++)
+
+For a security-critical parsing tool manipulating structures potentially crafted by adversaries, fuzzing is non-negotiable. Implementers MUST integrate `AFL++` (or equivalent coverage-guided fuzzers) directly into the CI pipeline.
+
+**Fuzzer Corpus:**
+The fuzzer MUST be seeded with the exact images generated by the `generate_test_corpus.sh` script (T-01 through T-12), ensuring coverage over highly fragmented, sparse, and compressed structures.
+
+**Fuzzer Invariants (Crash Conditions):**
+The fuzzer harness MUST wrap the engine's `--apply` mode and enforce the following invariants:
+1. **Memory Safety:** No `SIGSEGV`, `SIGABRT`, or `SIGILL`. Any crash is a release-blocking vulnerability.
+2. **Infinite Loop Protection:** Execution MUST terminate within `< 300 seconds` for a 10MB test image. A timeout indicates an infinite loop (e.g., recursive `$ATTRIBUTE_LIST` parsing failure).
+3. **Memory Exhaustion:** Peak RAM usage MUST NOT exceed `2x` the calculated theoretical bound for the `--low-memory` mode. Exceeding this indicates a memory leak or unbounded allocation vector.
 
 ---
 
