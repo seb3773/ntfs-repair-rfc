@@ -22,21 +22,37 @@
 
 This specification outlines the architecture and algorithms required to build an enterprise-grade NTFS filesystem check and repair utility. Unlike rudimentary tools that merely clear dirty flags, this specification details a true "Check Engine" capable of rebuilding B-Trees, parsing Data Runs, and handling complex MFT corruption.
 
-### 1.1 Core Engineering Philosophy: "Strict Determinism"
-The overarching design principle of this repair engine is **Strict Determinism**. The utility MUST prioritize absolute volume consistency over data salvage or storage optimization. Future implementers must adhere to the following rules when facing ambiguous corruption:
-1. **No Risky Heuristics:** The engine MUST NOT attempt to guess, probabilistically reconstruct, or pattern-match missing data (e.g., Update Sequence Arrays).
-2. **No Data Migration:** The engine MUST NOT attempt complex, interruptible optimizations like migrating attributes between Resident and Non-Resident states.
-3. **Deletion Over Dubious Repair:** If an attribute or index structure is fundamentally corrupted and cannot be rebuilt from a guaranteed ground truth (like child MFT records), the engine MUST delete the structure and fall back to Orphan Recovery rather than attempting a blind patch.
+#### 1.1 Scope: Repair vs. Recovery
+It is critical to distinguish between **Repair (fsck)** and **Data Recovery (carving)**.
+- **Repair (This Specification):** The goal is to restore the mathematical and structural consistency of the NTFS volume so it can be safely mounted read-write by the host OS. If an index cannot be perfectly rebuilt, it is deleted to preserve the integrity of the surviving B-Tree.
+- **Recovery (Out of Scope):** Opportunistic data extraction (e.g., scraping disk sectors for JPEGs or piecing together broken MFT records to save a single file).
 
-### 1.2 Main Engine Object & State Management
+If a structure cannot be cleanly repaired, it is not the engine's job to perform heroics; the engine will drop the structure to save the filesystem. **A filesystem repair engine is not expected to maximize data recovery, but to restore structural integrity. These goals are often in conflict.** Users needing data extraction from a fundamentally broken drive should use tools like TestDisk or PhotoRec *before* attempting structural repair.
+
+### 1.2 Design Principles vs Observed Behavior
+This document is a Request for Comments (RFC) for a *new* engine. It is not a strict transcription of the native NTFS standard, nor is it a clone of `chkdsk` behavior. Throughout this specification, rules are marked to clarify their origin:
+- **[NTFS STANDARD]:** A hard mathematical requirement of the NTFS format. Violating this guarantees an unmountable disk.
+- **[OBSERVED BEHAVIOR]:** How Windows or `chkdsk` empirically behaves (often undocumented).
+- **[DESIGN CHOICE]:** A deliberate engineering decision made by this specification. We explicitly choose safety, determinism, and predictability over Microsoft's undocumented heuristics.
+
+* **Observed `chkdsk` Behavior:** `chkdsk` may sometimes attempt partial recovery, use heuristics to guess missing pointers, or leave inconsistent states in an attempt to save user data.
+* **This Engine's Philosophy (Strict Determinism):** We prioritize absolute volume consistency over data salvage. Guessing introduces silent corruption.
+
+When facing ambiguous corruption, implementers must adhere to the following rules:
+1. **[DESIGN CHOICE] No Risky Heuristics:** The engine MUST NOT attempt to guess, probabilistically reconstruct, or pattern-match missing data (e.g., Update Sequence Arrays).
+2. **[DESIGN CHOICE] No Data Migration:** The engine MUST NOT attempt complex, interruptible optimizations like migrating attributes between Resident and Non-Resident states.
+3. **[DESIGN CHOICE] Deletion Over Dubious Repair:** If an attribute or index structure is fundamentally corrupted and cannot be rebuilt from a guaranteed ground truth, the engine MUST delete the structure and fall back to Orphan Recovery rather than attempting a partial or blind patch. A missing file is preferable to a cross-linked cluster chain that overwrites another file later.
+4. **[NTFS STANDARD] Endianness Ambiguity:** The NTFS format is strictly Little-Endian. All multi-byte structures MUST be parsed as Little-Endian regardless of the host architecture. Implementers compiling for Big-Endian systems MUST use byte-swapping macros (e.g., `le32_to_cpu`) to avoid instantaneous volume corruption.
+
+### 1.3 Main Engine Object & State Management
 The orchestrator must maintain a centralized State Object (Context) throughout execution. This object isolates I/O from the business logic.
 - **State & Phases:** Must track the current Verification Phase, error accumulation status, and volume metadata (cluster size, MFT record size).
 - **I/O Abstraction:** All raw disk access must be delegated to an isolated I/O sub-object (`io_context`) which exclusively handles physical `seek` and `read/write` operations based on calculated physical byte offsets.
 
-### 1.3 Verification Orchestrator (16-Step Pipeline)
+### 1.4 Verification Orchestrator (16-Step Pipeline)
 The main verification loop must run in distinct phases to safely rebuild the volume. This strict ordering prevents secondary corruption:
 | Phase | Name | Risk Level | Pre-Write Check |
-| :---: | :--- | :---: | :---: |
+| :---: | :--- | :--- | :---: |
 | 0 | **Boot Sector Validation** | **HIGH** | ✅ Yes |
 | 1 | **System File Open** ($MFT, $MFTMirr, $Bitmap, $LogFile) | **HIGH** | ✅ Yes |
 | 2 | **AttrDef & $UpCase Loading** | Medium | ✅ Yes |
@@ -73,9 +89,9 @@ flowchart TD
     P10["Phase 10: System File Re-open"]
     P11["Phase 11: $Extend Indexes\n§4 $Quota/$ObjId/$Reparse"]
     P12["Phase 12: Data Alignment Fix"]
-    P13["Phase 13: $Secure Verification\n§4 $SDS/$SII/$SDH"]
-    P14["Phase 14: $Bitmap Verification\n§3.3 Double-Pass"]
-    P15["Phase 15: $MFTMirr Final Sync\n§3.1"]
+    P13["Phase 13: Security Verification\n§3.10"]
+    P14["Phase 14: $Bitmap Verification\n§3.3"]
+    P15["Phase 15: $MFTMirr Correction\n§3.1"]
 
     P0 -->|"Boot valid"| P1
     P0 -->|"Both corrupt"| ABORT["ABORT: Unmountable"]
@@ -105,7 +121,7 @@ flowchart TD
     style P15 fill:#16213e,color:#e0e0e0
 ```
 
-### 1.4 Operational Modes & Repair Strategies
+### 1.5 Operational Modes & Repair Strategies
 
 To accommodate different levels of risk tolerance, the engine defines several operational strategies:
 
@@ -117,14 +133,15 @@ To accommodate different levels of risk tolerance, the engine defines several op
    > [!CAUTION]
    > **High-Risk Opt-In Mode.** In standard operation, the engine aborts if fundamental structures (like the root $MFT data run) are unreadable. In `--salvage-aggressive` mode, the engine ignores fatal pre-write checks and attempts to carve out surviving files to `found.000/`. This violates strict consistency rules and is strictly a last-resort data extraction mechanism, not a true repair.
 
-### 1.5 Boundaries of Repair: Known Unfixable States
+### 1.6 Boundaries of Repair: Known Unfixable States
 
 A mature engine must know when to abort. The following states are considered **unfixable** and must trigger a `FATAL` halt (unless `--salvage-aggressive` is active):
 - **Geometry Lost**: Both the primary Boot Sector and its backup are corrupt, missing, or contain contradictory sector/cluster sizing.
 - **Root $MFT Lost**: The Data Run for the primary `$MFT` (record 0) is entirely corrupted AND the `$MFTMirr` (record 1) is also corrupted. The engine cannot locate the volume's metadata.
 - **$LogFile Structure Lost**: The `$LogFile` is marked dirty, but the `LFS_RESTART_AREA` (in both redundancy pages) is unreadable. Replay is impossible, guaranteeing lost transactions.
+- **$Secure Structure Lost**: The `$Secure` file (MFT record 9) Data Run is corrupted AND the redundant SDS copies (every 256 KiB) are also unreadable. Without security descriptors, all files become accessible to everyone. The engine MUST abort unless `--salvage-aggressive` is specified.
 
-### 1.6 Market Context & Capability Comparison
+### 1.7 Market Context & Capability Comparison
 To understand the necessity of this specification, it is crucial to compare the capabilities of the engine described herein against existing open-source utilities. Currently, the Linux/open-source ecosystem lacks a true structural repair tool, relying heavily on basic flag-clearing utilities that cannot salvage severely corrupted trees.
 
 | Feature | This Specification | chkdsk (Windows) | ntfs-3g (ntfsfix) | ntfsprogs (Linux) |
@@ -139,6 +156,15 @@ To understand the necessity of this specification, it is crucial to compare the 
 | **Orphan Recovery** | ✅ Yes | ✅ Yes | ⚠️ Basic | ❌ No |
 | **Crash-Safety (WAL/COW)** | ✅ Yes | ✅ Yes (via NTFS Log) | ❌ No | ❌ No |
 | **Mode Read-Only** | ✅ Yes | ✅ Yes (`/scan`) | ✅ Yes | ✅ Yes |
+
+### 1.8 Encapsulated Volumes & Block Layer Abstractions
+When an NTFS volume is hosted within an encapsulated block layer (e.g., ZFS Zvols, LVM, RAID arrays, or Virtual Machine disks like VHDX/VMDK), the underlying host OS or hypervisor may mask physical sector corruption through its own Error Correction Codes (ECC) or parity mechanisms. 
+- **Risk:** If the host layer encounters unrecoverable block corruption, it may present a synthetic error (e.g., I/O Error) or zero-fill the block. The NTFS repair engine cannot distinguish this from native disk failure.
+- **Recommendation:** Users attempting to repair encapsulated volumes MUST first create a raw, block-level image copy (e.g., via `ddrescue`) of the underlying block device before running the repair tool. This protects against parity-sync cascades or snapshot invalidation triggered by the repair process.
+
+**Alternative when raw device is not available:**
+If the user cannot copy to a raw device, the engine MUST operate with the understanding that bad sector detection will be unreliable. It MUST log the following warning at startup:
+**"WARNING: Operating on a file-backed image on a checksummed filesystem (ZFS/btrfs). Physical bad sectors on the underlying media will be reported as corrected data, not EIO. Bad cluster relocation will NOT occur. Consider using 'dd conv=noerror,sync' to materialize errors as zero-filled blocks before repair."**
 
 ---
 
@@ -214,8 +240,8 @@ When the engine requests to read a specific VCN, it MUST NOT parse the raw Data 
 After reading the Boot Sector, the engine MUST read the NTFS version from the `$Volume` system file (MFT Record 3), specifically the `$VOLUME_INFORMATION` attribute (Type `0xFF`). The `MajorVersion` and `MinorVersion` bytes determine which validation features are applicable.
 
 **Unicode Interoperability & `$UpCase` Fallback:**
-The engine MUST use the volume's native `$UpCase` table (MFT Record 10) for all case-insensitive collation (e.g., sorting `$I30` B-Trees or namespace validation).
-- **Missing Table Fallback:** If the `$UpCase` file is completely destroyed or missing, the engine MUST fall back to a statically compiled Unicode uppercase mapping table to guarantee forward progress. The engine SHOULD log a `WARN`: *"Native $UpCase table lost; using static Unicode fallback."*
+The engine MUST exclusively use the volume's native `$UpCase` table (MFT Record 10) for all case-insensitive collation (e.g., sorting `$I30` B-Trees or namespace validation). The engine MUST NOT use the host operating system's Unicode tables (e.g., glibc or system ICU), as these may differ from the specific Unicode version used when the volume was formatted. Sorting an `$I30` B-Tree with the wrong collation table will render files invisible to Windows.
+- **Missing Table Fallback:** If the `$UpCase` file is completely destroyed or missing, the engine MUST fall back to a statically compiled Unicode uppercase mapping table that matches standard NTFS behavior to guarantee forward progress. The engine SHOULD log a `WARN`: *"Native $UpCase table lost; using static Unicode fallback."*
 - **Rare Scripts:** Implementations MUST ensure robust collation tests that include rare or complex Unicode scripts (e.g., Georgian, Ethiopian) to verify that case-folding behaves consistently across the entire Unicode range.
 
 | NTFS Version | OS Origin | MFT CRC32 | $UsnJrnl | 8-Byte-Aligned Attrs | Behavior Notes |
@@ -255,17 +281,21 @@ When reading an MFT record, the utility must evaluate its structural integrity:
 | ✅ Valid / ✅ Valid | ❌ Struct Fail (USA/CRC) | Copy Primary → Mirror (Phase 15) |
 | ✅ Valid / ✅ Valid | ✅ Valid / ❌ Semantic Fail | Copy Primary → Mirror (Phase 15) |
 
+*For system records 0–3 (critical metadata files), a state where BOTH primary and mirror are semantically corrupt (Bit Rot on both copies) is considered FATAL and triggers an abort with `E_SYSTEM_MFT_BOTH_CORRUPT`. The volume cannot be safely repaired without risking loss of the entire filesystem structure.*
+
 **Step 2: Final Synchronization (Phase 15)**
 Unlike legacy closed-source utilities that perform a dangerous "Blind Sync" based solely on header integrity, this specification mandates a strict **Semantic Validation Barrier** to prevent "Bit Rot" corruption from overwriting a healthy mirror.
-- **Semantic Validation Barrier:** Before syncing a primary `$MFT` record to the `$MFTMirr`, the engine MUST validate the internal semantics of all its attributes. It must verify valid Attribute Type codes, ensure the sum of attribute sizes is `≤` the record size, validate the internal consistency of Data Runs, and check for valid Unicode `$FILE_NAME` strings. Structural header checks (`FILE` magic, USA fixups) alone are insufficient.
+- **Pre-Condition Barrier:** The engine MUST NOT attempt to synchronize the `$MFTMirr` if Phase 4 (MFT Verification) failed to successfully repair the critical system records 0–3 of the primary `$MFT`. A stale but structurally sound mirror is vastly preferable to a mirror overwritten by a severely corrupted primary MFT.
+- **Semantic Validation Barrier:** Before syncing a primary `$MFT` record to the `$MFTMirr` (and during Phase 4 verification), the engine MUST validate the internal semantics of all its attributes. It must verify valid Attribute Type codes, validate the `is_non_resident` flag consistency (e.g., rejecting an attribute that claims to be resident but has a length exceeding the MFT record bounds, which causes buffer overflows), ensure the sum of all attribute sizes is `≤` the allocated record size, validate the internal consistency of Data Runs, and check for valid Unicode `$FILE_NAME` strings. Structural header checks (`FILE` magic, USA fixups) alone are insufficient.
 - **Action:** If the primary `$MFT` record passes BOTH structural and semantic validation, the utility overwrites the `$MFTMirr` record. However, if the primary record is structurally sound but semantically corrupt (Bit Rot), and the `$MFTMirr` record is semantically perfect, the utility MUST reverse the flow and use the `$MFTMirr` to heal the `$MFT`.
 - **Bounds Check (CRITICAL):** This synchronization MUST be strictly bounded by the physical size/Data Run of the `$MFTMirr`. Because the mirror is partial, the utility only syncs the first N records (usually 0 to 3). Attempting to copy the entire `$MFT` will overwrite arbitrary disk data.
 - **Verification:** It then re-reads both copies from disk and performs a strict byte-by-byte comparison to ensure the write operation succeeded.
-- **Conflict:** If the comparison fails (e.g., due to bad sectors on the mirror's physical location), an error is logged, but the engine proceeds normally relying solely on the primary `$MFT`.
+- **Conflict:** If the comparison fails due to physical bad sectors on the `$MFTMirr`'s disk location, the engine MUST NOT abort the finalization process. Instead, it MUST attempt to relocate the `$MFTMirr` by allocating new clusters and updating the `$MFTMirr` Data Run (and the Boot Sector pointer). If relocation is impossible, the engine logs `WARN_MFTMIRR_REDUNDANCY_LOST` and marks the volume as repaired but lacking redundancy, proceeding normally with the primary `$MFT`.
 
 ### 3.2 $Bad Attribute Handling (Bad Clusters)
 - **Identification:** Must be a `$DATA` attribute (Type 0x80) where the Name Length is 4 and the Name exactly matches the UTF-16LE string `"$Bad"`.
 - **Action:** Translate the Data Run into absolute physical cluster ranges and explicitly flag these clusters in the internal allocation map.
+- **Consistency Check with $Bitmap:** After parsing the `$Bad` Data Run, the engine MUST verify that every cluster in the bad list is marked as `USED` in the `$Bitmap`. If a named bad cluster is marked `FREE`, the engine MUST correct the `$Bitmap` and set it to `USED`. If a cluster is marked `USED` in `$Bitmap` but NOT in `$BadClus`, the engine leaves it as is (it may be legitimately allocated to a file).
 
 ### 3.3 Bitmap Allocation Validation & Rebuild
 > [!IMPORTANT]
@@ -278,6 +308,8 @@ Unlike legacy closed-source utilities that perform a dangerous "Blind Sync" base
   - It parses all Data Runs of all Non-Resident attributes.
   - **Sparse File Exemption:** If a Data Run is sparse (has a length but no physical LCN), it MUST be ignored. Sparse runs do not occupy physical sectors.
   - For physical runs, it translates the runs into physical Logical Cluster Numbers (LCN) and explicitly sets the corresponding bits to `USED` (1) in the calculated buffer.
+  - **Cluster Collision (Cross-Links):** If a cluster is already marked `USED` by another file during the walk, a cross-link exists. The engine MUST resolve it by prioritizing survival in this order: System Files (MFT 0-15) > User Files > Younger Files (based on `$UsnJrnl` or `LastModificationTime`). The losing file's Data Run MUST be truncated or marked corrupt.
+  - **Physical Bad Blocks:** If the engine encounters unreadable sectors during the verification walk, it MUST append those physical clusters to the `$BadClus` file's Data Run to prevent the filesystem from re-allocating them in the future.
 
 **Pass 2: Bit-by-Bit Reconciliation**
 - The utility then compares the calculated "Ground Truth" buffer against the actual `$Bitmap` read from the disk.
@@ -338,6 +370,7 @@ During the rebuild phase, the engine must implement three critical defensive che
 
 ### 3.6 $FILE_NAME Namespace Validation & DOS 8.3 Regeneration
 The utility must ensure absolute consistency between Long File Names (Win32) and Short File Names (DOS 8.3) across all MFT records to prevent namespace corruption in the B-Tree indexes.
+- **POSIX Namespace (4):** The engine MUST treat the POSIX namespace (4) identically to the Win32 namespace (0). As offline repair cannot reliably enforce or verify case-sensitivity rules, POSIX semantics are safely folded into Win32 collation.
 - **Validation:** The engine must read the namespace byte (offset `+0x41` in the `$FILE_NAME` attribute). It validates that the namespace is legal (0–3) and checks the bits (1 = Win32, 2 = DOS, 3 = Win32+DOS combined). 
 - **Cross-Validation:** It must verify that every Win32 name has a corresponding, valid DOS 8.3 paired name.
 - **Volume Config Exception:** Short name regeneration MUST respect the volume configuration. If 8.3 short name creation is disabled at the volume level (check `NtfsDisable8dot3NameCreation` registry flag, or absence of DOS namespace entries on the volume), the engine MUST skip this regeneration step entirely.
@@ -601,6 +634,7 @@ The attribute contains a `REPARSE_DATA_BUFFER` header:
 - *Invalid `ReparseTag` or size overflow:* Delete the `$REPARSE_POINT` attribute and clear the `FILE_ATTRIBUTE_REPARSE_POINT` flag from `$STANDARD_INFORMATION`. The file becomes a regular file rather than a link, which is safe.
 - *Flag mismatch only:* Correct the flag to match the presence/absence of the attribute. This is a surgical field-level fix that does not require deletion.
 - *Missing `$Reparse` index entry:* Re-insert the entry during the Phase 11 (`$Extend` Indexes Verification) pass.
+- **Circular Reference Detection:** When resolving a reparse point during Phase 11 (`$Extend` Indexes Verification), if the target MFT reference resolves back to the original file (directly or through a chain), the engine MUST treat this as a fatal error for that reparse point and delete it. Log `E_REPARSE_CIRCULAR` and clear the attribute.
 
 **Payload Sub-Validation for Known Tags:**
 For well-known Microsoft tags, the engine SHOULD validate the internal payload structure beyond the generic header:
@@ -727,7 +761,7 @@ The `$Extend\$ObjId` file contains a single `$O` index:
 **Orphan Recovery & Zombie Deletion (Phases 5 & 9):**
 If index entries are permanently lost during the rebuild, the targeted files will lose their directory links. 
 - **Zombie Deletion (Phase 5) - VULNERABILITY FIX:** Naïve implementations may aggressively delete "Zombie" MFT records (`IN_USE=1`) if they lack a primary `$DATA` (`0x80`) attribute. **This is a fatal structural flaw.** It silently deletes valid empty directories and files that store data exclusively in `$EA` (Extended Attributes, `0x64`) or `$LOGGED_UTILITY_STREAM` (`0xA0`).
-  - **Open-Source Rule:** The engine MUST NOT delete a record simply because `$DATA` is missing. A record is only a "Zombie" (and eligible for deletion) if it lacks a `$DATA` attribute AND lacks an `$INDEX_ROOT` attribute (`0x0B`) AND lacks any `$EA` or utility streams. System files (MFT IDs 0-15) and records with the `IS_DIRECTORY` (`0x02`) flag MUST never be deleted under this rule.
+  - **Open-Source Rule:** The engine MUST NOT delete a record simply because `$DATA` is missing. A record is only a "Zombie" (and eligible for deletion) if it lacks a `$DATA` attribute AND lacks an `$INDEX_ROOT` attribute (`0x0B`) AND lacks any `$EA` or utility streams (specifically `$LOGGED_UTILITY_STREAM` which is critical for EFS-encrypted files). System files (MFT IDs 0-15) and records with the `IS_DIRECTORY` (`0x02`) flag MUST never be deleted under this rule.
 - **Recovered Orphans (Phase 9):** If a valid MFT record has no parent directory pointing to it (or its parent's index is destroyed), it is an Orphan.
   - **Action:** The engine must re-link "Recovered Orphans" to a recovery directory (`found.000` or similar).
   - **Anti-Demotion Rule (CRITICAL):** When relinking an orphaned directory into the recovery folder, the engine MUST NOT clear its `IS_DIRECTORY` bit. A recovered directory must retain its directory structure and contents.
@@ -744,7 +778,7 @@ The `$LogFile` begins with two Restart Pages (at offset 0 and offset `SystemPage
 
 1. Read both Restart Pages. Validate `RSTR` magic + USA fixup on each.
 2. If both are valid, use the one with the **higher `CurrentLsn`** (it is more recent).
-3. If only one is valid, use it. If neither is valid → **FATAL: $LogFile is unrecoverable.**
+3. If only one is valid, use it. If neither is valid (e.g., bad USA fixup or missing magic) → **FATAL: $LogFile is unrecoverable.** The engine MUST log a major warning, safely bypass the journal replay step, and proceed directly to Phase 4. Attempting to parse or replay a corrupted log file is highly dangerous and will likely cause secondary corruption.
 4. From the Restart Area, extract:
    - `CurrentLsn` — the LSN to start replaying from
    - `Flags` — check bit `0x02` (`CLEAN_DISMOUNT`). If set → journal is clean, skip replay.
@@ -755,7 +789,11 @@ The `$LogFile` begins with two Restart Pages (at offset 0 and offset `SystemPage
 - Starting from `OldestLsn`, walk `RCRD` pages sequentially. Apply USA fixup to each page.
 - For each LFS Log Record within the page (may be multiple per page, may span pages via `flags & 0x01`):
   - Parse the record header (Appendix D.5) to extract: `this_lsn`, `client_previous_lsn`, `record_type`, `transaction_id`.
-  - Parse the NTFS Client Data to extract: `redo_operation`, `undo_operation`, `redo_offset`, `redo_length`, `target_attribute` type, `lcns_to_follow`, and `lcn_list[]`.
+  - Parse the NTFS Client Data (starting at offset 0x30 from the LFS record). The engine MUST parse it as follows:
+    1. Read fixed header (0x00–0x1F) to get `lcns_to_follow`.
+    2. If `lcns_to_follow > 0`, read N * 8 bytes for LCN array.
+    3. The `redo_data` immediately follows the LCN array (if any), or directly after the fixed header if `lcns_to_follow == 0`.
+    4. Extract: `redo_operation`, `undo_operation`, `redo_offset`, `redo_length`, `target_attribute` type.
 
 **Step 2 — Transaction Table Reconstruction:**
 Before replaying, build a Transaction Table by walking log records from `OldestLsn` to `CurrentLsn`:
@@ -867,7 +905,7 @@ The `$UsnJrnl` (Update Sequence Number Journal) is **fundamentally distinct** fr
 - **Advisory Use in Orphan Recovery (Phase 9 only):** When an MFT record is identified as a "Recovered Orphan" (valid `$DATA` but no indexing parent), the engine MAY consult `$UsnJrnl` as a **last-resort** source for metadata reconstruction:
   - *Filename Recovery:* If the MFT record's `$FILE_NAME` attribute is missing or corrupt, but `$UsnJrnl` contains a recent `USN_RECORD` entry with a matching `FileReferenceNumber`, the filename from that record MAY be used to name the recovered file in `found.000` (instead of the generic `FILE1024.CHK` fallback).
   - *Parent Directory Hint:* The `ParentFileReferenceNumber` from `$UsnJrnl` may provide a hint as to the file's original parent directory. This is informational only — it MUST NOT be used to directly re-link the orphan without independent structural validation of the parent's `$I30` index.
-- **USN Staleness Check:** A `USN_RECORD` whose `Usn` (sequence number) is older than the highest USN currently tracked in the `$MFT_BITMAP` or `$J` stream header MUST be considered stale. Stale records reflect operations that predate the current volume state and MUST be treated as hints only, not as authoritative filenames.
+- **USN Staleness Check:** A `USN_RECORD` whose `Usn` (sequence number) is older than the highest USN currently tracked in the `$MFT_BITMAP` or `$J` stream header MUST be considered stale. Furthermore, the engine MUST perform a **Timestamp Consistency Check**: if the `TimeStamp` of the USN record is older than the MFT record's `$STANDARD_INFORMATION.LastModificationTime`, the USN data is obsolete. Stale or obsolete records MUST be ignored for structural repair and used strictly as advisory fallback hints for naming `FILE####.CHK`.
 - **Integrity Check:** Before trusting any `$UsnJrnl` record, the engine MUST validate the record's `MajorVersion`, `MinorVersion`, and `RecordLength` fields. Malformed records MUST be silently skipped.
 
 **Reliability Assessment & Failure Modes:**
@@ -1121,6 +1159,11 @@ The following components are highest-risk and MUST be fuzz-tested before any rel
 - **Input:** A 1024-byte MFT record buffer.
 - **Specific mutation targets:** USA array size `> 3` (too large), USA sequence numbers that partially match (one sector ok, one not), CRC32 matching header but corrupt attribute body, attribute type `0xFFFFFFFF` (end marker) appearing at offset 0, `AttributeLength` causing a negative remaining space.
 - **Acceptance:** Zero crashes, zero ASan hits in 20 million iterations.
+
+**Harness 5 — Bitmap Reconciliation Logic (`fuzz_bitmap`):**
+- **Input:** Two Roaring Bitmaps (Ground Truth, On-Disk) and a sequence of correction decisions.
+- **Specific mutation targets:** Disagreement between computed and on-disk, edge cases where cluster count = 0 or > total_clusters, overflow in range addition.
+- **Acceptance:** No logical error (e.g., freeing a cluster that is USED in truth, or allocating a cluster beyond volume bounds).
 
 **Adversarial Image Test (Mandatory Pre-Release):**
 Beyond byte-level fuzzing, the engine MUST be tested against **structurally valid but semantically adversarial images** — maliciously crafted inputs designed to trigger logical bugs rather than memory errors:
@@ -1664,7 +1707,7 @@ Offset  Hex / Size                                       Field
 | +0x0C | 2 | `target_attribute` | Attribute type being modified (e.g., `0x0080`) |
 | +0x0E | 2 | `lcns_to_follow` | Number of LCN entries following |
 | +0x10 | 2 | `record_offset` | Offset within MFT record |
-| +0x12 | 2 | `attribute_offset` | Offset within attribute |
+| +0x12 | 2 | `padding` | (Often incorrectly cited as attribute_offset; use redo_offset) |
 | +0x14 | 2 | `cluster_block_offset` | Cluster offset |
 | +0x18 | 4 | `target_vcn` | Target VCN (if non-resident) |
 | +0x20 | 8×N | `lcn_list[]` | LCNs of target clusters |
@@ -1725,6 +1768,9 @@ Offset  Size  Field                           Description
 
 ### D.8 LFS_RESTART_PAGE — Structural Layout
 Located at the beginning of the `$LogFile`. There are two copies (at offset `0x0` and offset `SystemPageSize`).
+
+> [!NOTE]
+> The `$LogFile` structure has minor variations between Windows versions (e.g., Windows 10 introduced larger `LFS_CLIENT_RECORD` padding). The offsets documented in D.8–D.10 are correct for NTFS 3.1 (Windows XP and later). For older volumes (NTFS 1.2), the engine should fall back to [MS-NTFS] §2.6 for the exact layout, but in practice those legacy volumes rarely have a dirty `$LogFile` requiring replay.
 
 | Offset | Size | Name | Description |
 | :--- | :--- | :--- | :--- |
