@@ -1,6 +1,6 @@
 # Pseudo-Code Reference — NTFS Clean Room Repair Utility
 
-> **Companion to:** `chkufsd_clean_room_spec.md`
+> **Companion to:** `ntfs-repair_clean_room_spec.md`
 > **Purpose:** Implementable pseudo-code for every critical algorithm. Each block references its parent section in the main specification.
 > **Convention:** All integers are unsigned 64-bit unless noted. All disk offsets are byte-aligned. All structures are little-endian.
 
