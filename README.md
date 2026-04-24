@@ -54,17 +54,17 @@ This specification was developed under a strict **Clean Room** methodology to en
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    INFORMATION BARRIER                       │
+│                    INFORMATION BARRIER                      │
 │                                                             │
 │  ✅ ALLOWED SOURCES              ❌ FORBIDDEN SOURCES       │
 │  ─────────────────               ────────────────────       │
-│  • [MS-NTFS] public spec        • Windows source code       │
-│  • MSDN / Microsoft Learn       • chkdsk.exe disassembly    │
-│  • ntfs.com documentation       • NTFS.sys decompilation    │
-│  • Academic papers               • Leaked code / NDA docs    │
-│  • Black-box I/O observation     • Proprietary headers       │
-│  • Controlled corruption tests   • Internal Microsoft docs   │
-│  • Public WDK headers (ntifs.h)  • Third-party NDA tools     │
+│  • [MS-NTFS] public spec         • Windows source code      │
+│  • MSDN / Microsoft Learn        • chkdsk.exe disassembly   │
+│  • ntfs.com documentation        • NTFS.sys decompilation   │
+│  • Academic papers               • Leaked code / NDA docs   │
+│  • Black-box I/O observation     • Proprietary headers      │
+│  • Controlled corruption tests   • Internal Microsoft docs  │
+│  • Public WDK headers (ntifs.h)  • Third-party NDA tools    │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
