@@ -72,6 +72,9 @@ The main verification loop must run in distinct phases to safely rebuild the vol
 
 *Note: A Pre-Write Check of "Yes" indicates that a FATAL error in this phase MUST abort the process before any physical disk writes are permitted.*
 
+**Transactional Checkpoints:**
+To prevent an aborted phase from leaving the filesystem in a half-written, unrecoverable state, the engine MUST create a checkpoint before beginning any new phase. A checkpoint stores the current phase ID, the WAL LSN, and a backup of critical in-memory states (e.g., modified MFT records). If a phase (like Phase 8 B-Tree Rebuild) fails midway, the engine rolls back the WAL to the checkpoint LSN to restore the pre-phase state.
+
 **Pipeline Dependency Diagram:**
 
 ```mermaid
@@ -175,6 +178,7 @@ Before any repair is attempted, the utility maps the volume structures and ensur
 ### 2.1 Bidirectional Boot Sector Synchronization (Phase 0)
 The absolute first step of the utility is to read and validate the primary NTFS Boot Sector (Sector 0) and the backup NTFS Boot Sector (stored at the very last sector of the partition).
 - **Validation Criteria:** The engine performs 7+ strict checks on both sectors: the `0x55AA` signature, the `"NTFS    "` magic string, `bytes_per_sector`, `sectors_per_cluster`, total volume size, `$MFT` start cluster, and `$MFTMirr` start cluster.
+  - **4Kn Support (CRITICAL):** The engine MUST explicitly allow `bytes_per_sector` to be either `512` or `4096`. A rigid check for `bps == 512` will falsely reject valid 4K Native (4Kn) drives, causing immediate repair failure.
 - **Bidirectional Synchronization:** 
   - If the Primary is corrupt but the Backup is valid, the engine overwrites the Primary with the Backup.
   - If the Primary is valid but the Backup is corrupt, the engine overwrites the Backup with the Primary.
@@ -306,6 +310,7 @@ Unlike legacy closed-source utilities that perform a dangerous "Blind Sync" base
 - The utility allocates a zeroed buffer corresponding to the total number of clusters on the volume (or total MFT records).
 - It performs a complete sequential walk of the MFT. For every record marked `FILE_RECORD_IN_USE`:
   - It parses all Data Runs of all Non-Resident attributes.
+  - **Deferred Validation (CRITICAL):** If a Data Run is corrupted or invalid, the engine MUST NOT abort the Ground Truth construction. It MUST log a warning and skip the corrupted record, allowing the rest of the volume's Ground Truth to be mapped. The corrupted record will be addressed by Phase 4/9.
   - **Sparse File Exemption:** If a Data Run is sparse (has a length but no physical LCN), it MUST be ignored. Sparse runs do not occupy physical sectors.
   - For physical runs, it translates the runs into physical Logical Cluster Numbers (LCN) and explicitly sets the corresponding bits to `USED` (1) in the calculated buffer.
   - **Cluster Collision (Cross-Links):** If a cluster is already marked `USED` by another file during the walk, a cross-link exists. The engine MUST resolve it by prioritizing survival in this order: System Files (MFT 0-15) > User Files > Younger Files (based on `$UsnJrnl` or `LastModificationTime`). The losing file's Data Run MUST be truncated or marked corrupt.
@@ -603,6 +608,8 @@ The `$EA` attribute (Type `0x64`) stores a linked list of `FILE_FULL_EA_INFORMAT
 > [!NOTE]
 > Behavioral analysis of existing repair utilities (attribute type `0x100`) confirms that `$TXF_DATA` receives **no explicit handling**: no comparison against type `0x100` is present anywhere in the implementation, and the specialized Journal Replay path only dispatches for `$DATA` (`0x80`) and `$INDEX_ALLOCATION` (`0xB0`). `$TXF_DATA` may be updated incidentally by the generic positional copy handler if it happens to be located at the targeted log record offset — this is coincidental, not intentional.
 >
+> **[DESIGN CHOICE] Orphaned Transaction Prevention:** While TxF is deprecated, an orphaned transaction can lock files permanently. If a `$TXF_DATA` (Type `0x100`) attribute is non-resident, the engine MUST verify its cross-references without attempting to replay it. It must verify that the LSNs inside `$TXF_DATA` point to valid bounds within the `$LogFile`. If the LSNs are invalid or point outside the journal, the transaction is lost and the engine MUST delete the `$TXF_DATA` attribute to unlock the file.
+
 > This is acceptable in practice: TxF has been deprecated since Windows 8 and is not present on volumes created or accessed by modern Windows. The open-source implementation MUST follow the same policy — **no explicit `$TXF_DATA` handling**. If encountered, treat as any other `$LOGGED_UTILITY_STREAM`: validate Data Runs, preserve payload opaquely, delete only on Data Run corruption.
 
 **EFS Header Structural Validation (Optional Enhancement):**
@@ -735,6 +742,7 @@ A flat, sequentially-packed stream of `SDS_ENTRY` structures:
 - Offset `0x08` (8 bytes): `Offset` — self-referential offset of this entry within `$SDS`.
 - Offset `0x10` (4 bytes): `Length` — total size of this entry (header + SD + padding).
 - Offset `0x14` (variable): Self-relative Security Descriptor (standard `SECURITY_DESCRIPTOR` with `Revision`, `Control`, Owner SID, Group SID, SACL, DACL).
+  - **NFSv4 ACLs Exception:** If the `Control` field indicates a SACL is present (`SE_SACL_PRESENT = 0x8000`), the engine MUST NOT assume the DACL structural layout applies to the SACL. Windows utilizes extended SACLs for granular NFSv4 permissions; blindly validating them as DACLs will cause false-positive corruption triggers.
 - **Alignment:** Each entry is padded to a **16-byte boundary**.
 - **Redundancy:** Each entry is stored **twice** in `$SDS`, separated by exactly `0x40000` (256 KiB). If entry at offset `X` is corrupt, the copy at `X + 0x40000` can be used for recovery.
 - **Boundary Rule:** An entry MUST NOT cross a 256 KiB boundary (Windows cache manager limitation).
@@ -744,6 +752,7 @@ A flat, sequentially-packed stream of `SDS_ENTRY` structures:
 2. Verify the `HashKey` by recomputing the `ror 29` hash over the security descriptor body.
 3. Cross-check every `SecurityId` against the `$SII` index — each ID must have a corresponding index entry.
 4. Cross-check the `$SDH` (Security Descriptor Hash) index — each hash must point to a valid `$SDS` offset.
+  - **Hash Collision Protection (CRITICAL):** The `$SDH` index is a B-Tree mapping `Hash → Offset`. Hashes are NOT guaranteed to be unique. The engine MUST NOT blindly delete the entire `$SDH` index entry if one hash collision occurs. It must scan sequentially and only delete an entry if its specific `offset` is invalid (e.g., `offset >= sds.length`) or if the corresponding SDS entry at that exact offset does not match the hash.
 5. **Orphan Detection:** If an `$SII` entry points to an `$SDS` offset containing a corrupt or missing entry, delete the `$SII` entry. Files referencing that `SecurityId` will receive a default security descriptor.
 
 **$Quota Index Validation — Phase 11:**
@@ -891,6 +900,7 @@ Opcode distribution within the 38-case redo dispatch:
 
 **Recommended Implementation Roadmap:**
 - **v1.0 — Attribute-Located Generic Replay:** Locate the target attribute by type+name (Section 5, Steps 1–2). For all opcodes that map to the generic positional copy handler (23/38 cases), apply `redo_data` at `attribute_offset` within the located attribute. For opcodes `0x00`–`0x01` and `0x1D`–`0x24` (no-ops), skip silently. For unsupported specialized opcodes (`0x0A`, `0x17`–`0x1C`), **skip with `E_JOURNAL_SKIP` WARN** rather than misapplying.
+  - *Helper Definition:* `find_attribute_by_type_and_name(record, attr_type, target_name_utf16)` MUST iterate through the record's attributes. If `target_name_utf16` is empty, it returns the first attribute matching `attr_type` with an empty name. If it is populated, it MUST compare the target name against the attribute name using case-insensitive `$UpCase` comparison. It is a fatal error to use naive byte-comparison for named attributes.
 - **v2.0 — Specialized Opcode Handlers (optional):** Implement the 7 specialized handlers for complete fidelity. Gate behind `--replay-mode=full`. Required only for forensic-grade replay.
 - **Deviation D-04 (Appendix B)** documents this choice and its rationale.
 
@@ -907,6 +917,7 @@ The `$UsnJrnl` (Update Sequence Number Journal) is **fundamentally distinct** fr
   - *Parent Directory Hint:* The `ParentFileReferenceNumber` from `$UsnJrnl` may provide a hint as to the file's original parent directory. This is informational only — it MUST NOT be used to directly re-link the orphan without independent structural validation of the parent's `$I30` index.
 - **USN Staleness Check:** A `USN_RECORD` whose `Usn` (sequence number) is older than the highest USN currently tracked in the `$MFT_BITMAP` or `$J` stream header MUST be considered stale. Furthermore, the engine MUST perform a **Timestamp Consistency Check**: if the `TimeStamp` of the USN record is older than the MFT record's `$STANDARD_INFORMATION.LastModificationTime`, the USN data is obsolete. Stale or obsolete records MUST be ignored for structural repair and used strictly as advisory fallback hints for naming `FILE####.CHK`.
 - **Integrity Check:** Before trusting any `$UsnJrnl` record, the engine MUST validate the record's `MajorVersion`, `MinorVersion`, and `RecordLength` fields. Malformed records MUST be silently skipped.
+  - **Vulnerability Fix (CRITICAL):** The engine MUST explicitly reject `RecordLength > 65536` and `FileNameLength > 1024`. A malicious volume can supply `0xFFFF` for these lengths, which will cause a buffer overflow during filename recovery.
 
 **Reliability Assessment & Failure Modes:**
 The `$UsnJrnl` advisory scan is inherently best-effort. Developers MUST anticipate and gracefully handle the following failure scenarios:
@@ -950,8 +961,21 @@ While this specification outlines the core algorithmic behaviors extracted from 
 **Parallel Merge Algorithm for >10 TB Volumes:**
 1. **Shard:** Divide the MFT into N segments (N = number of CPU cores, or `total_mft_records / 100,000`, whichever is smaller).
 2. **Map:** Each worker thread receives a segment range `[start_record, end_record)`. It walks Data Runs for all records in its range and populates a thread-local Roaring Bitmap.
-3. **Reduce:** When all workers complete, merge bitmaps pairwise using `roaring_bitmap_or_inplace()`. With 8 cores, this requires 3 merge rounds (log₂(8) = 3).
+3. **Reduce:** When all workers complete, merge bitmaps into a master bitmap.
+   - **Data Race Protection:** Do NOT use `roaring_bitmap_or_inplace()` across multiple threads on the same target bitmap, as it mutates the source destructively and causes a data race. The engine MUST perform a two-pass reduction or safely use `roaring_bitmap_or()` (which creates a new bitmap) under proper lock boundaries.
 4. **Memory Bound:** Peak memory = `N * per_thread_bitmap + 1 * master_bitmap`. For a 16 TB volume with 8 threads: ~64 MB × 8 + 64 MB = **576 MB** peak. This fits comfortably in a server with 2+ GB RAM.
+
+**MFT Caching Layer (LRU):**
+For very large volumes (e.g., >10TB), reading the MFT sequentially during each phase will cause extreme performance degradation. The engine MUST implement an LRU (Least Recently Used) cache for MFT records.
+```c
+struct MftCache {
+    uint64_t record_id;
+    uint8_t* data;
+    uint64_t sequence_number; // Invalidate if modified
+    uint64_t last_access;
+};
+```
+The cache should be sized to hold the ~100,000 most recently accessed records (~100MB RAM overhead).
 
 **`io_context` VTable Contract (Formal API):**
 All disk I/O MUST go through a single abstraction layer. The contract below defines the minimal required interface:
@@ -1001,39 +1025,24 @@ Each `read()` and `write()` call MUST be bounded by a timeout (default: 30 secon
 
 > [!WARNING]
 > **Do NOT use `alarm()` / `SIGALRM` for I/O timeouts.** `alarm()` is process-wide (one timer per process). With the Parallel Merge Algorithm (Section 6.1, N worker threads), a later `alarm()` call from thread B silently cancels thread A's timer — leaving thread A blocked indefinitely on a dying disk.
->
-> **Do NOT use `ppoll()` / `poll()` on block device file descriptors.** On Linux, `poll()` on a block device fd returns `POLLIN` immediately — block devices are always "ready" from poll's perspective (see `poll(2)` man page). The actual blocking occurs inside `pread()`, which ppoll cannot bound. This means `ppoll()` will return `ready = 1`, and the subsequent `pread()` will hang indefinitely on a dying controller.
 
-**Thread-safe timeout implementations (choose one):**
+**Thread-safe timeout implementation:**
 ```c
-// Option 1 (RECOMMENDED): io_uring with linked timeout
-// Linux ≥ 5.5, via liburing. Submits read + IORING_OP_LINK_TIMEOUT
-// as an atomic SQE pair. The kernel cancels the read if the timeout
-// fires first — this works correctly on block devices.
-struct io_uring_sqe *sqe_read = io_uring_get_sqe(&ring);
-io_uring_prep_read(sqe_read, ctx->fd, buf, len, offset);
-sqe_read->flags |= IOSQE_IO_LINK;  // link to next SQE
+// PORTABLE & ROBUST: O_NONBLOCK + ppoll
+// io_uring is complex and kernel-dependent, while pthread_cancel()
+// on a blocked thread is dangerous and may leak resources.
+// The optimal solution is non-blocking I/O with ppoll multiplexing.
+fcntl(fd, F_SETFL, O_NONBLOCK);
+struct pollfd pfd = {.fd = fd, .events = POLLIN};
+struct timespec timeout = {.tv_sec = timeout_sec, .tv_nsec = 0};
 
-struct io_uring_sqe *sqe_timeout = io_uring_get_sqe(&ring);
-struct __kernel_timespec ts = { .tv_sec = timeout_sec };
-io_uring_prep_link_timeout(sqe_timeout, &ts, 0);
-
-io_uring_submit(&ring);
-// Wait for CQE — if timeout fires, read CQE has res = -ECANCELED
-
-// Option 2 (PORTABLE FALLBACK): Thread-per-IO watchdog
-// Delegate all I/O to a dedicated worker thread.
-// Main thread waits with pthread_mutex_timedlock().
-// On timeout → pthread_cancel() the I/O thread.
-pthread_create(&io_thread, NULL, io_worker, &io_req);
-struct timespec deadline;
-clock_gettime(CLOCK_REALTIME, &deadline);
-deadline.tv_sec += timeout_sec;
-int rc = pthread_mutex_timedlock(&io_req.done_mutex, &deadline);
-if (rc == ETIMEDOUT) {
-    pthread_cancel(io_thread);  // forcefully abort the blocked pread()
-    log(FATAL, E_IO_TIMEOUT, ...);
-    abort();
+int ret = ppoll(&pfd, 1, &timeout, NULL);
+if (ret == 0) {
+    return ERR_TIMEOUT; // Device hung
+}
+if (ret > 0 && (pfd.revents & POLLIN)) {
+    ssize_t bytes_read = read(fd, buf, len);
+    // Handle short reads / errors
 }
 ```
 
@@ -1297,7 +1306,7 @@ if (__builtin_mul_overflow((uint64_t)cluster_count, (uint64_t)bytes_per_cluster,
 
 #### Pitfall 2: Concurrency — Race Conditions on the Shared Bitmap
 - **Problem:** If the Double-Pass Bitmap Ground Truth is built with a thread pool (Section 6.1), multiple threads writing bits into a shared raw byte array will produce data races, corrupting the Ground Truth and causing spurious Cross-Link detections or missed cluster leaks.
-- **Fix:** Use thread-local Roaring Bitmaps for each worker thread. Merge them (OR operation) into a single master bitmap under a lock only at the end of Pass 1. Alternatively, use atomic bit-set operations (`atomic_fetch_or`) if a flat array must be used.
+- **Fix:** Use thread-local Roaring Bitmaps for each worker thread. Merge them into a single master bitmap sequentially using `roaring_bitmap_or` (creating a new bitmap) or properly locked sequential accumulation. Avoid `roaring_bitmap_or_inplace()` in parallel reductions to prevent destructive mutation races. Alternatively, use atomic bit-set operations (`atomic_fetch_or`) if a flat array must be used.
 
 #### Pitfall 3: Endianness
 - **Problem:** NTFS is strictly little-endian. On big-endian host architectures (PowerPC, s390x), reading a 16-bit or 64-bit field directly from a disk buffer with a C cast will silently produce a byte-swapped, nonsensical value.
