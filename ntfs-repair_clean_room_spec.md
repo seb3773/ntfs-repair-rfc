@@ -176,17 +176,33 @@ If the user cannot copy to a raw device, the engine MUST operate with the unders
 Before any repair is attempted, the utility maps the volume structures and ensures the foundational boot record is sound.
 
 ### 2.1 Bidirectional Boot Sector Synchronization (Phase 0)
-The absolute first step of the utility is to read and validate the primary NTFS Boot Sector (Sector 0) and the backup NTFS Boot Sector (stored at the very last sector of the partition).
-- **Validation Criteria:** The engine performs 7+ strict checks on both sectors: the `0x55AA` signature, the `"NTFS    "` magic string, `bytes_per_sector`, `sectors_per_cluster`, total volume size, `$MFT` start cluster, and `$MFTMirr` start cluster.
-  - **4Kn Support (CRITICAL):** The engine MUST explicitly allow `bytes_per_sector` to be either `512` or `4096`. A rigid check for `bps == 512` will falsely reject valid 4K Native (4Kn) drives, causing immediate repair failure.
+The absolute first step of the utility is to read and validate the primary NTFS Boot Sector (Sector 0) and the backup NTFS Boot Sector. The backup is stored at the very last sector of the partition. For implementers, the exact physical offset calculation is:
+`backup_byte_offset = partition_start + (TotalSectors - 1) * bytes_per_sector`
+- **Validation Criteria:** The engine MUST explicitly perform these 7 strict checks on both sectors:
+  1. Boot signature MUST be `0x55AA`.
+  2. OEM ID magic string MUST be `"NTFS    "`.
+  3. `bytes_per_sector` MUST be exactly `512`.
+  4. `sectors_per_cluster` MUST be a power of 2 (or valid negative shift).
+  5. Total volume size (sectors) MUST be `> 0` and within physical device bounds.
+  6. `$MFT` start cluster MUST be within volume bounds.
+  7. `$MFTMirr` start cluster MUST be within volume bounds.
+  - **Logical Sector Size (CRITICAL):** According to [MS-NTFS] §2.2, `bytes_per_sector` MUST be exactly 512. Windows will refuse to mount a volume with a logical sector size of 1024, 2048, or 4096 in the BPB. The engine MUST enforce `bps == 512`.
+  - **512e Emulation Support & 4Kn:** A 4K Native (4Kn) disk still emulates 512-byte logical sectors (512e) at the filesystem level. The Boot Sector will contain `bytes_per_sector == 512` while the underlying hardware block size is `4096`. The engine MUST differentiate this to prevent Read-Modify-Write (RMW) penalties during repair:
+    ```c
+    io_ctx->physical_sector = get_physical_sector_size(fd);  // via BLKPBSZGET
+    io_ctx->logical_sector  = get_logical_sector_size(fd);   // via BLKSSZGET
+    if (boot->bytes_per_sector == 512 && io_ctx->physical_sector == 4096) {
+        // 512e Drive: Acceptable, but strictly use physical_sector for I/O buffer alignment
+    }
+    ```
 - **Bidirectional Synchronization:** 
-  - If the Primary is corrupt but the Backup is valid, the engine overwrites the Primary with the Backup.
+  - If the Primary is corrupt but the Backup is valid, the engine overwrites the Primary with the Backup. **Warning:** The engine MUST reconcile critical geometry fields (e.g., `TotalSectors` might be smaller on the backup if the partition was resized and the backup was not updated) rather than performing a blind byte-for-byte overwrite.
   - If the Primary is valid but the Backup is corrupt, the engine overwrites the Backup with the Primary.
 - **Field-Level Correction:** If specific BIOS Parameter Block (BPB) fields are invalid but the sector is largely intact, the engine can surgically repair individual fields (e.g., total sectors, `$MFT` cluster offset) rather than discarding the entire sector.
 - **MFT Record Size Parsing (CRITICAL):** The Boot Sector field at offset `0x40` (`clusters_per_mft_record`) uses a signed-byte encoding that MUST be handled correctly:
   - **Positive value:** `MFT_Record_Size = value * cluster_size`.
   - **Negative value (two's complement):** `MFT_Record_Size = 2^|value|`. For example, `0xF6` = `-10` → `2^10 = 1024 bytes`; `0xF4` = `-12` → `2^12 = 4096 bytes`.
-  - The same encoding applies to offset `0x44` (`clusters_per_index_record`) for INDX page sizes.
+  - The same encoding applies to offset `0x44` (`clusters_per_index_record`) for INDX page sizes. Note: if `cluster_size = 512` bytes, an INDX size of `4096` bytes spans `4096/512 = 8` clusters.
   - **Impact:** All bounds checks, USA array sizes (1 fixup entry per 512-byte sector = `MFT_Record_Size / 512` entries), and Journal Replay buffer allocations MUST use this dynamically parsed size. Hardcoding 1024 is a fatal error on 4096-byte volumes.
 - **Rule:** This bidirectional sync is critical. Unlike basic utilities that abort if Sector 0 is unreadable (e.g., overwritten by a rogue GRUB installation), the engine MUST actively seek the backup and restore Sector 0 to guarantee mountability.
 
@@ -218,6 +234,14 @@ While standard NTFS documentation ([MS-NTFS] §2.5) describes Data Runs as a "va
    - *Physical Bounds:* The computed physical LCN range MUST be validated against the total volume cluster count. Any overflow throws an Out Of Range error (`ERR_INVALID_CLUSTER_RANGE`).
    - *VCN Continuity:* The starting VCN of the current run MUST perfectly equal the sum of all preceding runs' cluster counts. A discontinuity invalidates the entire file mapping.
    - *Size Allocation Bounds:* The sum of all cluster counts across all runs multiplied by the cluster size MUST be large enough to cover the attribute's `Allocated_Size` declared in its header. If it falls drastically short, the run sequence is truncated or corrupt.
+     - **Overflow Prevention (CRITICAL):** The parser MUST prevent 64-bit integer wrap-around when accumulating cluster counts. A maliciously crafted sequence of runs can exploit an overflow to bypass bounds checking:
+       ```c
+       uint64_t total_clusters = 0;
+       if (__builtin_add_overflow(total_clusters, run_count, &total_clusters) ||
+           __builtin_mul_overflow(total_clusters, cluster_size, &total_bytes)) {
+           return ERR_VOLUME_TOO_LARGE;
+       }
+       ```
 6. **Inline Bitmap Validation:** For every decoded non-sparse run, the parser MUST sequentially validate each physical cluster against the volume `$Bitmap`.
    - **Action:** A direct query is made to the Bitmap Manager (operation "check only").
    - **Rule:** If any cluster in the run is marked as 'free' in the `$Bitmap`, the parser must instantly flag a Cross-Linked error (`ERR_CROSS_LINKED`) and halt the run parsing.
@@ -268,10 +292,10 @@ The utility separates the MFT repair process into two distinct logical steps to 
 **Step 1: Validation & Reconstruction (Phase 5)**
 When reading an MFT record, the utility must evaluate its structural integrity:
 - **Trigger:** If the record lacks the `FILE` magic signature (`ERR_BAD_MFT_RECORD`) or fails the Update Sequence Array (USA) validation (`ERR_USA_MISMATCH`), the primary `$MFT` is deemed corrupt.
-- **Modern NTFS (3.1+) Checksum Validation:** For modern NTFS volumes, MFT records include an explicit CRC32 checksum. The engine MUST calculate the CRC32 over the entire record *except* the last 4 bytes (which store the expected checksum). If the calculated checksum does not match the stored checksum, the record MUST be flagged as corrupt, identical to a USA failure.
+- **Modern NTFS (3.1+) Checksum Validation:** For modern NTFS volumes, MFT records include an explicit CRC32 checksum. The engine MUST calculate the CRC32 over the entire record *except* the last 4 bytes (which store the expected checksum). **Order of Operations (CRITICAL):** The CRC32 MUST be calculated *after* the Update Sequence Array (USA) fixups have been successfully applied. Calculating the checksum on raw, unpatched sectors will result in a false positive corruption flag. If the calculated checksum does not match the stored checksum, the record MUST be flagged as corrupt, identical to a USA failure.
 - **Strict Fixup Rule (No Heuristics):** When applying the USA fixups to sectors, the engine MUST compare the sector's Update Sequence Number (USN) with the last 2 bytes of the sector. If they do not match, the fixup fails. The engine MUST NOT attempt to guess the missing values, use pattern matching (e.g., `0x0000`), or rebuild it from adjacent sectors. Guessing introduces silent corruption.
 - **Action:** If the USA fixup fails, the engine clears the `IN_USE` bit of the record, effectively declaring it `FREE`, and attempts to reconstruct it by fetching the corresponding record from the `$MFTMirr`. If the mirror record is structurally sound, it is used to repair the corrupt primary `$MFT` record.
-  - **Range Limitation Rule (CRITICAL):** The `$MFTMirr` is NOT a complete mirror of the `$MFT`. It typically only contains the first 4 system records (records 0–3). The utility MUST check if the corrupt record ID falls within the mirrored range before attempting a recovery from `$MFTMirr`. For records beyond this range, the `$MFTMirr` is useless, and the record must remain marked as `FREE` and trigger Orphan Recovery.
+  - **Range Limitation Rule (CRITICAL):** The `$MFTMirr` is NOT a complete mirror of the `$MFT`. The utility MUST NOT hardcode a limit of 0-3. Instead, it MUST calculate the mirrored range dynamically from the `$MFTMirr` Data Run size (e.g., if the run is 32KB and records are 4KB, it mirrors records 0 to 7). The utility MUST check if the corrupt record ID falls within this dynamically calculated range before attempting a recovery from `$MFTMirr`. For records beyond this range, the `$MFTMirr` is useless, and the record must remain marked as `FREE` and trigger Orphan Recovery.
 
 **MFT Record Repair Decision Matrix:**
 *(Applies to System Records 0–3 where `$MFTMirr` is available. For records > 3, any Structural or Semantic failure results in marking the record `FREE` and triggering Orphan Recovery).*
@@ -292,7 +316,7 @@ Unlike legacy closed-source utilities that perform a dangerous "Blind Sync" base
 - **Pre-Condition Barrier:** The engine MUST NOT attempt to synchronize the `$MFTMirr` if Phase 4 (MFT Verification) failed to successfully repair the critical system records 0–3 of the primary `$MFT`. A stale but structurally sound mirror is vastly preferable to a mirror overwritten by a severely corrupted primary MFT.
 - **Semantic Validation Barrier:** Before syncing a primary `$MFT` record to the `$MFTMirr` (and during Phase 4 verification), the engine MUST validate the internal semantics of all its attributes. It must verify valid Attribute Type codes, validate the `is_non_resident` flag consistency (e.g., rejecting an attribute that claims to be resident but has a length exceeding the MFT record bounds, which causes buffer overflows), ensure the sum of all attribute sizes is `≤` the allocated record size, validate the internal consistency of Data Runs, and check for valid Unicode `$FILE_NAME` strings. Structural header checks (`FILE` magic, USA fixups) alone are insufficient.
 - **Action:** If the primary `$MFT` record passes BOTH structural and semantic validation, the utility overwrites the `$MFTMirr` record. However, if the primary record is structurally sound but semantically corrupt (Bit Rot), and the `$MFTMirr` record is semantically perfect, the utility MUST reverse the flow and use the `$MFTMirr` to heal the `$MFT`.
-- **Bounds Check (CRITICAL):** This synchronization MUST be strictly bounded by the physical size/Data Run of the `$MFTMirr`. Because the mirror is partial, the utility only syncs the first N records (usually 0 to 3). Attempting to copy the entire `$MFT` will overwrite arbitrary disk data.
+- **Bounds Check (CRITICAL):** This synchronization MUST be strictly bounded by the physical size/Data Run of the `$MFTMirr`. Because the mirror is partial, the utility only syncs the first N records. The limit MUST be calculated dynamically from the `$MFTMirr` Data Run size (e.g., if the run is 32KB and records are 4KB, it mirrors records 0 to 7). Do not hardcode a limit of 0-3. Attempting to copy the entire `$MFT` will overwrite arbitrary disk data.
 - **Verification:** It then re-reads both copies from disk and performs a strict byte-by-byte comparison to ensure the write operation succeeded.
 - **Conflict:** If the comparison fails due to physical bad sectors on the `$MFTMirr`'s disk location, the engine MUST NOT abort the finalization process. Instead, it MUST attempt to relocate the `$MFTMirr` by allocating new clusters and updating the `$MFTMirr` Data Run (and the Boot Sector pointer). If relocation is impossible, the engine logs `WARN_MFTMIRR_REDUNDANCY_LOST` and marks the volume as repaired but lacking redundancy, proceeding normally with the primary `$MFT`.
 
@@ -326,7 +350,7 @@ Before committing the reconciliation to disk (specifically when freeing clusters
 - **Heuristic Consensus:** The decision to free a massive block of clusters MUST reach a predefined consensus threshold (e.g., 2/3 of heuristic checks passing) to prevent a parser bug from destroying data.
 - **WAL Snapshot:** The engine MUST write the proposed Bitmap changes to the Write-Ahead Log (WAL) and `fsync` the log BEFORE altering the physical `$Bitmap`. This guarantees the operation can be aborted or rolled back if the OS crashes during the massive write operation.
 
-*Note:* This exact same double-pass algorithm is applied to the `$MFT:$BITMAP` during Phase 14, using MFT indexes instead of physical clusters.
+*Note:* This exact same double-pass algorithm is applied to the `$MFT:$BITMAP` during Phase 14, using MFT indexes instead of physical clusters. **Crucial Cap:** The Ground Truth for `$MFT:$BITMAP` MUST be capped to the actual number of allocated MFT records (derived from the `$MFT` Data Run total size). If the engine does not explicitly bound the bitmap checks to this maximum record count, it will throw off-by-N errors or falsely detect "lost" records beyond the MFT's physical allocation.
 
 > [!WARNING]
 > **TRIM / DISCARD Prohibition**
@@ -375,7 +399,7 @@ During the rebuild phase, the engine must implement three critical defensive che
 
 ### 3.6 $FILE_NAME Namespace Validation & DOS 8.3 Regeneration
 The utility must ensure absolute consistency between Long File Names (Win32) and Short File Names (DOS 8.3) across all MFT records to prevent namespace corruption in the B-Tree indexes.
-- **POSIX Namespace (4):** The engine MUST treat the POSIX namespace (4) identically to the Win32 namespace (0). As offline repair cannot reliably enforce or verify case-sensitivity rules, POSIX semantics are safely folded into Win32 collation.
+- **POSIX Namespace (4):** The engine MUST treat the POSIX namespace (4) identically to the Win32 namespace (0). As offline repair cannot reliably enforce or verify case-sensitivity rules, POSIX semantics are safely folded into Win32 collation. *(Note: The POSIX namespace is largely a relic of NTFS 1.x; modern Windows uses the Win32/DOS namespaces, but repair tools must still handle legacy flags gracefully).*
 - **Validation:** The engine must read the namespace byte (offset `+0x41` in the `$FILE_NAME` attribute). It validates that the namespace is legal (0–3) and checks the bits (1 = Win32, 2 = DOS, 3 = Win32+DOS combined). 
 - **Cross-Validation:** It must verify that every Win32 name has a corresponding, valid DOS 8.3 paired name.
 - **Volume Config Exception:** Short name regeneration MUST respect the volume configuration. If 8.3 short name creation is disabled at the volume level (check `NtfsDisable8dot3NameCreation` registry flag, or absence of DOS namespace entries on the volume), the engine MUST skip this regeneration step entirely.
@@ -413,6 +437,7 @@ The engine MUST scan the parent directory's `$I30` index to check for collisions
 
 ```
 function generate_83_name(lfn, parent_dir_index, upcase_table):
+    // Note: lfn and upcase_table operate on UTF-16LE. Ensure endianness is correct.
     // Normalize
     upper = upcase_convert(lfn, upcase_table)
     upper = strip_leading_trailing_spaces(upper)
@@ -469,7 +494,7 @@ When an I/O read failure indicates a physical hardware bad sector (`EIO`) on a c
 
 **Edge Case 1 — `$MFTMirr` on a Bad Sector:**
 If the physical cluster(s) belonging to `$MFTMirr` itself are unreadable:
-1. **Attempt Relocation:** Apply the standard Mark & Reallocate procedure to move `$MFTMirr` to a healthy physical cluster. Update the `$MFTMirr` LCN in both the Boot Sector primary and backup copies.
+1. **Attempt Relocation:** Apply the standard Mark & Reallocate procedure to move `$MFTMirr` to a healthy physical cluster. Update the `$MFTMirr` LCN in both the Boot Sector primary and backup copies. This MUST be explicit in the relocation step to prevent a stale backup boot sector from restoring the old, bad LCN later during Phase 0.
 2. **If Relocation Fails (no healthy clusters available):** Log a `FATAL` level warning: "$MFTMirr cannot be relocated — operating without mirror." Proceed with repair using the primary `$MFT` exclusively. The Phase 15 synchronization MUST be skipped entirely to avoid writing to an unwritable physical location.
 
 **Edge Case 2 — `$BadClus` Self-Corruption (Bootstrap Problem):**
@@ -548,12 +573,16 @@ function decompress_lznt1_chunk(chunk_data, chunk_size):
                 pos += 1
             else:
                 // Back-reference
-                tuple = le16(chunk_data[pos..pos+2])
+                tuple = chunk_data[pos] | (chunk_data[pos+1] << 8)
                 pos += 2
                 disp_bits = compute_displacement_bits(len(output))
                 len_bits  = 16 - disp_bits
                 displacement = (tuple >> len_bits) + 1
                 length       = (tuple & ((1 << len_bits) - 1)) + 3
+                
+                if displacement > len(output):
+                    displacement = len(output)  // MS-XCA bounds handling (wrap/modulo bounds)
+                
                 // Copy from output[current_pos - displacement]
                 src = len(output) - displacement
                 if src < 0:
@@ -564,6 +593,7 @@ function decompress_lznt1_chunk(chunk_data, chunk_size):
 ```
 
 **Corruption indicators:** Signature ≠ 3, displacement pointing before start of output, chunk_size + 1 > 4096 for uncompressed chunks, infinite loops in decompression.
+- **Stream Termination & Size Bounds:** After a chunk, the engine MUST read the next chunk header. A header of `0x0000` terminates the stream. The decompressor MUST explicitly track the total uncompressed length produced and abort if it exceeds the attribute's `Data_Size` (which often differs from `Allocated_Size` for compressed files). Do not blindly decompress until exhaustion if it overruns the logical file size.
 
 ### 3.10 Alternate Data Streams (ADS) Handling
 In NTFS, a single file can contain multiple `$DATA` attributes. The primary data stream is unnamed (name length = 0), while Alternate Data Streams (ADS) have explicit names (e.g., `Zone.Identifier`).
@@ -641,7 +671,20 @@ The attribute contains a `REPARSE_DATA_BUFFER` header:
 - *Invalid `ReparseTag` or size overflow:* Delete the `$REPARSE_POINT` attribute and clear the `FILE_ATTRIBUTE_REPARSE_POINT` flag from `$STANDARD_INFORMATION`. The file becomes a regular file rather than a link, which is safe.
 - *Flag mismatch only:* Correct the flag to match the presence/absence of the attribute. This is a surgical field-level fix that does not require deletion.
 - *Missing `$Reparse` index entry:* Re-insert the entry during the Phase 11 (`$Extend` Indexes Verification) pass.
-- **Circular Reference Detection:** When resolving a reparse point during Phase 11 (`$Extend` Indexes Verification), if the target MFT reference resolves back to the original file (directly or through a chain), the engine MUST treat this as a fatal error for that reparse point and delete it. Log `E_REPARSE_CIRCULAR` and clear the attribute.
+- **Circular Reference Detection:** When resolving a reparse point during Phase 11 (`$Extend` Indexes Verification), if the target MFT reference resolves back to the original file (directly or through a chain), the engine MUST treat this as a fatal error for that reparse point and delete it. Log `E_REPARSE_CIRCULAR` and clear the attribute. The engine MUST implement cycle detection (e.g., Floyd's "Hare and Tortoise" algorithm) to avoid infinite loops:
+  ```c
+  bool has_reparse_cycle(uint64_t mft_id, io_context *ctx, uint64_t max_depth) {
+      uint64_t slow = mft_id, fast = mft_id;
+      while (max_depth-- > 0) {
+          slow = resolve_reparse_target(slow, ctx);
+          fast = resolve_reparse_target(fast, ctx);
+          if (fast == 0) return false;
+          fast = resolve_reparse_target(fast, ctx);
+          if (slow == fast) return true;  // Cycle détecté
+      }
+      return true;  // Trop profond, considéré comme cycle
+  }
+  ```
 
 **Payload Sub-Validation for Known Tags:**
 For well-known Microsoft tags, the engine SHOULD validate the internal payload structure beyond the generic header:
@@ -668,6 +711,7 @@ A deduplicated file is a stub with a reparse point redirecting reads to the chun
 ## 4. B-Tree & Index Rebuild ($I30, Security, Quotas)
 
 The utility must be capable of rebuilding B-Trees for directory indexes (`$I30`) and security streams (`$SII`, `$SDS`).
+- **Named Streams Exemption:** Directories can legitimately contain named `$DATA` streams (e.g. `Zone.Identifier` or macOS `com.apple.quarantine`). The index rebuilder MUST NOT assume that an `$INDEX_ROOT` attribute mutually excludes a `$DATA` attribute. Both can perfectly coexist on a directory MFT record.
 
 **3-Level Active Repair Strategy (with Supplementary Orphan INDX Sweep):**
 If an index is flagged for verification or repair, the utility must not merely patch pointers. It must execute a rigid defensive pipeline to guarantee structural perfection:
@@ -789,6 +833,7 @@ The `$LogFile` begins with two Restart Pages (at offset 0 and offset `SystemPage
 2. If both are valid, use the one with the **higher `CurrentLsn`** (it is more recent).
 3. If only one is valid, use it. If neither is valid (e.g., bad USA fixup or missing magic) → **FATAL: $LogFile is unrecoverable.** The engine MUST log a major warning, safely bypass the journal replay step, and proceed directly to Phase 4. Attempting to parse or replay a corrupted log file is highly dangerous and will likely cause secondary corruption.
 4. From the Restart Area, extract:
+   - **Version Check (CRITICAL):** Verify `MajorVersion`. If `MajorVersion == 2` (LFS 2.0, introduced in Windows 8.1/10), the engine MUST abort the replay phase (`WARN_JOURNAL_VERSION_UNSUPPORTED`) and gracefully skip to the next repair phase. LFS 2.0 introduces larger sector alignments and different field sizes (see [MS-FSCC] 2.1.1). Because journal replay is a best-effort structural rollback, skipping it is preferable to crashing or corrupting data with a v1.0 parser.
    - `CurrentLsn` — the LSN to start replaying from
    - `Flags` — check bit `0x02` (`CLEAN_DISMOUNT`). If set → journal is clean, skip replay.
    - `ClientArrayOffset` → `LFS_CLIENT_RECORD` array: contains `OldestLsn` (earliest log record that may still need replay)
@@ -869,6 +914,9 @@ Before replaying, build a Transaction Table by walking log records from `OldestL
 | `0x23` | `UpdateRelativeDataIndex` | Index | Generic copy |
 | `0x24` | `UpdateRelativeDataAllocation` | Index | Generic copy |
 | `0x25` | `ZeroEndOfFileRecord` | MFT | Generic copy |
+| `0x26` | `UpdateFileNameDataRoot` | Index | Generic copy |
+| `0x27` | `UpdateFileNameDataAllocation` | Index | Generic copy |
+| `0x28` | `SetStandardInformation` | Attribute | Generic copy |
 
 **v1.0 Handler Categories:**
 - **Generic copy** (23 opcodes): Read `redo_data` from log record. Copy `redo_length` bytes to `redo_offset` within the located attribute. This is the positional copy handler.
@@ -928,7 +976,7 @@ The `$UsnJrnl` advisory scan is inherently best-effort. Developers MUST anticipa
 | Journal fully wrapped (all records stale) | High (small volumes) | All records predate corruption | Skip; all entries fail staleness check |
 | `FileReferenceNumber` collision (reused MFT slot) | Low | Filename maps to a different file | Mitigated by `SequenceNumber` cross-check |
 | `$UsnJrnl` Data Runs corrupt | Rare | Journal unreadable | Treat as disabled; skip without error |
-| Multiple USN records for same MFT ID | Common (rename chains) | Ambiguous filename | Use the record with the **highest `Usn`** value (most recent operation) |
+| Multiple USN records for same MFT ID | Common (rename chains) | Ambiguous filename | Use the record with the **highest `Usn`** value (most recent operation). *Note:* For rename chains, the highest USN usually contains the target/new name. This is acceptable as the filename is merely an advisory hint for recovery. |
 
 > [!WARNING]
 > The `$UsnJrnl` scan MUST NEVER cause a repair failure or abort. If any error occurs during advisory scanning, the engine silently falls back to generic naming (`FILE####.CHK`). The entire Section 5.1 is an optional enhancement, not a critical repair path.
@@ -995,7 +1043,7 @@ typedef struct io_context {
     /* Core I/O — all offsets/sizes MUST be physical_sector-aligned */
     int (*read) (struct io_context *ctx, uint64_t offset, void *buf, size_t len);
     int (*write)(struct io_context *ctx, uint64_t offset, const void *buf, size_t len);
-    int (*sync) (struct io_context *ctx);  /* fsync / fdatasync */
+    int (*sync) (struct io_context *ctx);  /* MUST guarantee write barrier (e.g. fdatasync) to prevent NVMe reordering */
 
     /* Error reporting */
     int  last_errno;               /* preserved from failed read/write */
@@ -1157,7 +1205,7 @@ The following components are highest-risk and MUST be fuzz-tested before any rel
 **Harness 2 — LZNT1 Decompressor (`fuzz_lznt1`):**
 - **Input:** Raw compressed chunk (up to 4096 bytes).
 - **Specific mutation targets:** Decompression bombs, invalid back-reference displacements (pointing before the start of the output buffer), chunk sizes exceeding 4096 bytes, infinite loop triggering flags.
-- **Acceptance:** Strict OOM limits must not trigger; zero buffer over-reads.
+- **Acceptance:** Strict OOM limits must not trigger; zero buffer over-reads. The harness MUST implement a hard output limit (e.g., `if (decompressed_size > 16 * 1024 * 1024) return 0;`) to reject Zip bombs without crashing the fuzzer.
 
 **Harness 3 — INDX Node Parser (`fuzz_indx_node`):**
 - **Input:** Raw INDX page (4096 bytes).
@@ -1217,7 +1265,7 @@ The following are non-binding but strongly recommended technology choices. They 
 #### Recommended Libraries
 | Component | Recommended Library | Notes |
 | :--- | :--- | :--- |
-| **LZNT1 Decompression** | `ntfs-3g` / `wimlib` source | Both are LGPL; extractable as standalone modules |
+| **LZNT1 Decompression** | `liblzf` or custom Clean Room | `ntfs-3g` (LGPL) and `wimlib` (GPL) carry license contamination risks. Use BSD/MIT alternatives or a custom clean room implementation. |
 | **Unicode / $UpCase** | `libunicode` or `icu4c` | For B-Tree collation; `icu4c` preferred for full Unicode 15 support |
 | **Roaring Bitmaps** | [CRoaring](https://github.com/RoaringBitmap/CRoaring) | Apache 2.0; C library with Rust bindings (`roaring`). C API: `roaring_bitmap_t *`, `roaring_bitmap_add_range()`, `roaring_bitmap_contains()`, `roaring_bitmap_or_inplace()` |
 | **Test Framework (C)** | [Criterion](https://github.com/Snaipe/Criterion) | TAP-compatible, supports fixtures and parameterized tests |
@@ -1337,9 +1385,15 @@ int64_t delta = (int64_t)(int8_t)last_byte << 56;
 - **Fix:** The collation function MUST use the `$UpCase` table loaded from the volume itself (Phase 4 of the pipeline). Never substitute a generic Unicode library's case-folding for the NTFS-specific uppercase table.
 - **Version Variance Warning:** The `$UpCase` table embedded on the volume varies slightly between Windows versions. A volume formatted by Windows XP (Unicode 3.0 era) will have a different `$UpCase` table than a volume formatted by Windows 10/11 (Unicode 13+ era) — certain codepoints that were unassigned in Unicode 3.0 now have uppercase mappings. Using a locally generated `$UpCase` table (e.g., from the host OS's Unicode library or a hardcoded table compiled into the tool) instead of the volume's own table will produce **subtly incorrect sort orders** that may only manifest for filenames containing uncommon Unicode characters (e.g., Georgian, Cherokee, or recently-added scripts). This is an insidious bug because it passes all ASCII test cases perfectly.
 
-#### Pitfall 7: "Allocate Before Free" Cluster Reuse Hazard
-- **Problem:** When relocating a bad cluster (Section 3.8), a naïve implementation might allocate a new cluster, copy data, then free the old one. If the Bitmap update is interrupted, the next run of the tool might cross-link both files to the same cluster.
-- **Fix:** Strictly follow a **"Mark Bad → Free Old → Flush Bitmap → Allocate New"** sequence. The bitmap must be flushed to disk (committed) between the free and the allocate operations to guarantee that no two files can claim the same physical cluster, even across a crash-and-resume cycle.
+#### Pitfall 7: $BadClus Relocation Race Condition
+- **Problem:** When relocating a bad cluster (Section 3.8), a naïve sequence of "Mark Bad → Free Old → Flush → Allocate New" has a dangerous race condition. If a crash occurs between Free and Allocate, the old cluster is exposed to recycling before the new data is secured.
+- **Fix (CRITICAL):** Use a strict two-phase transaction sequence to guarantee safety. The engine MUST wrap each metadata mutation within its Write-Ahead Log (WAL) to prevent "lost clusters" if interrupted:
+  1. Allocate NEW cluster (do NOT free the old one yet) [WAL logged].
+  2. Copy the surviving data to NEW.
+  3. Update the file's Data Run to point to NEW [WAL logged].
+  4. Perform a complete `sync()` (Flush 1).
+  5. Append OLD to the `$BadClus:$Bad` run and clear its bit in the `$Bitmap` (Free Old) [WAL logged].
+  6. Perform a complete `sync()` (Flush 2).
 
 #### Pitfall 8: ECC/RAID/ZFS Transparent Error Correction Masking
 - **Problem:** When the NTFS volume resides on a storage layer with transparent error correction (e.g., a ZFS dataset, btrfs subvolume, or hardware RAID with ECC), the host layer may **silently "heal" read errors** before they reach the repair engine. This means:
