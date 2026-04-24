@@ -866,6 +866,11 @@ Before replaying, build a Transaction Table by walking log records from `OldestL
 **Step 3 — Semantic Attribute Location:**
 - For each log record in a committed transaction, resolve the target cluster(s) via `lcn_list[]`.
 - Read the target MFT record or INDX page from disk. Apply USA fixup.
+- **Pre-Replay Minimal Validation (CRITICAL):** Because Phase 3 (Journal Replay) runs *before* Phase 4 (MFT Record Verification), the target structure is entirely unverified. Before applying any opcode, the engine MUST perform a minimal structural check on the loaded block:
+  - The block MUST pass USA fixups (`ERR_USA_MISMATCH` aborts replay for this record).
+  - The `FILE` or `INDX` magic signature MUST be correct.
+  - The `allocated_size` must be valid (`1024` or `4096`).
+  If any check fails, the engine MUST silently drop the log record and abort the replay for this specific entry. Applying journal edits to a fundamentally corrupted block writes data to incorrect offsets, exacerbating corruption before Phase 4 can salvage it.
 - Locate the target attribute by `type + name` (case-insensitive name comparison using the volume's `$UpCase` table).
 - **Attribute Not Found:** If the attribute does not exist (e.g., it was deleted after the log record was written), the engine MUST create a new attribute of the specified type, aligned to an 8-byte boundary.
 - **Attribute Found:** Apply the redo operation at the current physical location.
@@ -1034,9 +1039,10 @@ struct MftCache {
     uint8_t* data;
     uint64_t sequence_number; // Invalidate if modified
     uint64_t last_access;
+    bool     is_dirty;        // CRITICAL: Must be flushed before eviction
 };
 ```
-The cache should be sized to hold the ~100,000 most recently accessed records (~100MB RAM overhead).
+The cache should be sized to hold the ~100,000 most recently accessed records (~100MB RAM overhead). **Write-Through / Eviction Rule:** Because the engine writes changes directly to the cache during B-Tree rebuilds (Phase 8), the cache MUST implement a strict write-through or flush-on-eviction policy. If `is_dirty == true`, the eviction routine MUST write the block to the WAL and `fsync` it to disk before freeing the cache slot. Failing to do so results in silent metadata loss.
 
 **`io_context` VTable Contract (Formal API):**
 All disk I/O MUST go through a single abstraction layer. The contract below defines the minimal required interface:
@@ -1088,23 +1094,23 @@ Each `read()` and `write()` call MUST be bounded by a timeout (default: 30 secon
 > **Do NOT use `alarm()` / `SIGALRM` for I/O timeouts.** `alarm()` is process-wide (one timer per process). With the Parallel Merge Algorithm (Section 6.1, N worker threads), a later `alarm()` call from thread B silently cancels thread A's timer — leaving thread A blocked indefinitely on a dying disk.
 
 **Thread-safe timeout implementation:**
-```c
-// PORTABLE & ROBUST: O_NONBLOCK + ppoll
-// io_uring is complex and kernel-dependent, while pthread_cancel()
-// on a blocked thread is dangerous and may leak resources.
-// The optimal solution is non-blocking I/O with ppoll multiplexing.
-fcntl(fd, F_SETFL, O_NONBLOCK);
-struct pollfd pfd = {.fd = fd, .events = POLLIN};
-struct timespec timeout = {.tv_sec = timeout_sec, .tv_nsec = 0};
+> [!CAUTION]
+> **Do NOT use `ppoll()` / `poll()` on block device file descriptors.** On Linux, `poll()` on a block device fd returns `POLLIN` immediately — block devices are always "ready" from poll's perspective (see `poll(2)` man page). The actual blocking occurs inside `pread()`, which ppoll cannot bound. This means `ppoll()` will return `ready = 1`, and the subsequent `pread()` will hang indefinitely on a dying controller.
 
-int ret = ppoll(&pfd, 1, &timeout, NULL);
-if (ret == 0) {
-    return ERR_TIMEOUT; // Device hung
-}
-if (ret > 0 && (pfd.revents & POLLIN)) {
-    ssize_t bytes_read = read(fd, buf, len);
-    // Handle short reads / errors
-}
+To safely timeout a hanging block device, the engine MUST use one of the following true asynchronous I/O architectures:
+
+**Option 1: `io_uring` (Modern Linux)**
+```c
+// Utilize io_uring with IORING_OP_LINK_TIMEOUT to enforce a strict
+// kernel-level timeout on the IORING_OP_READ operation.
+```
+
+**Option 2: Thread Watchdog (Portable Fallback)**
+```c
+// A dedicated watchdog thread monitors the primary I/O thread.
+// The I/O thread acquires a mutex before pread(), and the watchdog attempts
+// pthread_mutex_timedlock(). If the timeout expires and the lock is still held,
+// the I/O thread is irrecoverably hung. The engine MUST abort gracefully.
 ```
 
 **Mock adapter for testing:**
@@ -1124,30 +1130,27 @@ This enables deterministic unit tests for every repair phase without a physical 
   - *Recovery:* Upon startup, the utility checks for an unclosed WAL. If found, it reads the last `TX_ID`, compares the `OLD_CRC` on disk, and either applies the `PAYLOAD` (roll-forward) or ignores it if already written.
 - **Strict Write Ordering:** Define and strictly enforce the order of I/O writes to disk (e.g., always write the MFT record first, then the `$Bitmap`, and finally the `$MFTMirr`). Re-read and compute checksums after each write to guarantee the physical disk has committed the data before proceeding.
 
-**WAL Entry Format (Binary Specification):**
-Each WAL entry is a fixed-header + variable-payload record:
+**WAL Transaction Format (Multi-Sector Atomicity):**
+A single logical operation (e.g., relocating `$BadClus`) may require modifying an MFT record, the `$Bitmap`, and the `$MFTMirr`. If the engine crashes between these writes, the volume is fundamentally inconsistent. To solve this, the WAL MUST support multi-sector transactions.
 
-| Offset | Size | Field | Description |
+| Operation Type | Size | Field | Description |
 | :--- | :--- | :--- | :--- |
-| 0x00 | 4 | `magic` | `0x57414C31` ("WAL1") |
-| 0x04 | 4 | `tx_id` | Monotonically increasing transaction ID |
-| 0x08 | 2 | `phase_id` | Pipeline phase (0–15) that generated this write |
-| 0x0A | 2 | `flags` | `0x01` = committed, `0x00` = pending |
-| 0x0C | 8 | `disk_offset` | Absolute byte offset on the target volume |
-| 0x14 | 4 | `payload_len` | Length of the payload in bytes |
-| 0x18 | 4 | `old_crc32` | CRC32 of the original on-disk data before this write |
-| 0x1C | 4 | `new_crc32` | CRC32 of the payload (for verification after write) |
-| 0x20 | V | `payload` | The exact bytes to be written to `disk_offset` |
-| 0x20+V | 4 | `entry_crc32` | CRC32 of the entire entry (header + payload), for WAL self-integrity |
+| `BEGIN_TX` | 8 | `magic`+`tx_id` | `0x54584247` ("TXBG"), followed by Transaction ID |
+| `WRITE` | 36+V | Header+Payload | Contains `disk_offset`, `payload_len`, `old_crc32`, `new_crc32`, `payload`, and `entry_crc32` |
+| `COMMIT_TX` | 8 | `magic`+`tx_id` | `0x5458434D` ("TXCM"), followed by Transaction ID. Marks TX as fully flushed to WAL. |
+
+*Note on `entry_crc32`:* Every `WRITE` entry MUST end with a CRC32 of its own header and payload. This is critical because the host OS might crash while writing the WAL to the host filesystem, resulting in a partially written `WRITE` record.
 
 **Recovery Algorithm on Startup:**
 1. Open WAL file. If absent or empty → no recovery needed.
-2. Walk entries sequentially. For each entry where `flags == 0x00` (pending):
-   a. Read `payload_len` bytes from `disk_offset` on the volume.
+2. Read the WAL sequentially to identify all fully formed transactions (a `BEGIN_TX` paired with a matching `COMMIT_TX`).
+   a. If a `BEGIN_TX` lacks a `COMMIT_TX` (or if a `WRITE` fails its `entry_crc32` check), the transaction is incomplete (host crash during WAL flush). The engine MUST completely ignore this transaction (no writes are forwarded to disk) and truncate the WAL.
+3. For each `WRITE` entry within a valid, committed transaction:
+   a. Read `payload_len` bytes from `disk_offset` on the target volume.
    b. Compute CRC32 of what's on disk.
-   c. If disk CRC == `old_crc32` → write was never applied. Apply `payload` to disk. Set `flags = 0x01`.
-   d. If disk CRC == `new_crc32` → write was already applied (crash after write, before flag update). Set `flags = 0x01`.
-   e. If disk CRC matches neither → **FATAL**: volume was modified by another tool between crash and recovery. Abort.
+   c. If disk CRC == `old_crc32` → write was never applied. Apply `payload` to disk.
+   d. If disk CRC == `new_crc32` → write was already applied (crash after write). Proceed.
+   e. If disk CRC matches neither → **`E_WAL_CONFLICT`**. Because we have verified the WAL's internal `entry_crc32` and `COMMIT_TX` barrier, this state exclusively proves the volume was mounted and modified by another tool between the crash and recovery. **FATAL**: Abort immediately.
 3. After all entries are resolved, delete the WAL file.
 
 **Operational Modes (Formal Definition):**

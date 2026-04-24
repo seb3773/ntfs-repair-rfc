@@ -20,6 +20,8 @@
 10. [$Secure Stream Validation](#10-secure-stream-validation-4-phase-13)
 11. [WAL Crash Recovery](#11-wal-crash-recovery-62)
 12. [io_context Error Handler](#12-io_context-error-handler-61)
+13. [MftCache Write-Through Eviction](#13-mftcache-write-through-eviction-61)
+
 
 ---
 
@@ -104,7 +106,9 @@ function decode_data_runs(attr_data, total_clusters):
 
         if length_len == 0 OR length_len > 4:
             return ERROR(E_DATARUN_MALFORMED)
-        if offset_len > 4:
+        if offset_len > 8:
+            // NTFS supports up to 8-byte LCNs, which is required for
+            // volumes larger than ~16TB.
             return ERROR(E_DATARUN_MALFORMED)
 
         pos += 1
@@ -682,6 +686,34 @@ function io_read_with_timeout(ctx, offset, buf, len, timeout_sec=30):
         abort()
 
     return result
+```
+
+---
+
+## 13. MftCache Write-Through Eviction (§6.1)
+
+```
+function evict_mft_cache(cache, io):
+    // Find Least Recently Used entry
+    lru_entry = cache.find_lru()
+
+    if lru_entry.is_dirty:
+        // CRITICAL: Must write-through to WAL and disk before evicting.
+        // Failing to do this loses modifications made directly in cache (e.g. B-Tree rebuilds).
+        
+        // 1. Write to WAL (Multi-sector atomic transaction)
+        tx_id = wal_begin_tx(io)
+        wal_append_write(io, tx_id, lru_entry.disk_offset, lru_entry.data, mft_record_size)
+        wal_commit_tx(io, tx_id)
+        
+        // 2. Write to disk
+        io.write(lru_entry.disk_offset, lru_entry.data, mft_record_size)
+        
+        // 3. Mark clean
+        lru_entry.is_dirty = false
+
+    // Now safe to evict and reuse
+    cache.free_slot(lru_entry)
 ```
 
 ---
